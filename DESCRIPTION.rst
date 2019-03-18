@@ -9,6 +9,15 @@ Source code is also available at: https://github.com/snowflakedb/snowflake-conne
 Release Notes
 -------------------------------------------------------------------------------
 
+- v1.7.8 (March 12,2019)
+
+    - Add OCSP signing certificate validity check
+
+- v1.7.7 (February 22,2019)
+
+    - Skip HEAD operation when OVERWRITE=true for PUT
+    - Update copyright year from 2018 to 2019 for Python
+
 - v1.7.6 (February 08,2019)
 
     - Adjusted pyasn1 and pyasn1-module requirements for Python Connector

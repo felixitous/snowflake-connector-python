@@ -849,11 +849,14 @@ class SnowflakeConnection(object):
             password=self._password,
         )
 
-        keys['_token'] = auth_instance.__dict__['_token']
-        keys['_proof_key'] = auth_instance.__dict__['_proof_key']
-        user_auth = open(saved_user, 'wb')
-        pickle.dump(keys, user_auth)
-        user_auth.close()
+        try:
+            keys['_token'] = auth_instance.__dict__['_token']
+            keys['_proof_key'] = auth_instance.__dict__['_proof_key']
+            user_auth = open(saved_user, 'wb')
+            pickle.dump(keys, user_auth)
+            user_auth.close()
+        except Exception:
+            pass
 
     def __set_session_parameters(self, auth_instance):
         auth = Auth(self.rest)

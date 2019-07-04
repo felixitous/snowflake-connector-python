@@ -29,7 +29,7 @@ from pyasn1_modules import (rfc2459, rfc2437, rfc2560)
 from snowflake.connector.ocsp_snowflake import SnowflakeOCSP
 from .compat import (PY2)
 from .errorcode import (ER_INVALID_OCSP_RESPONSE, ER_INVALID_OCSP_RESPONSE_CODE)
-from .errors import (OperationalError)
+from .errors import (RevocationCheckError)
 from .rfc6960 import (
     OCSPRequest,
     OCSPResponse,
@@ -268,7 +268,7 @@ class SnowflakeOCSPPyasn1(SnowflakeOCSP):
                 logger.debug(
                     'not found issuer_der: %s', self._get_issuer_hash(cert))
                 if issuer_hash not in SnowflakeOCSP.ROOT_CERTIFICATES_DICT:
-                    raise OperationalError(
+                    raise RevocationCheckError(
                         msg="CA certificate is NOT found in the root "
                             "certificate list. Make sure you use the latest "
                             "Python Connector package and the URL is valid.")
@@ -355,47 +355,35 @@ class SnowflakeOCSPPyasn1(SnowflakeOCSP):
     def _convert_generalized_time_to_datetime(self, gentime):
         return datetime.strptime(str(gentime), '%Y%m%d%H%M%SZ')
 
+    def check_cert_time_validity(self, cur_time, tbs_certificate):
+        cert_validity = tbs_certificate.getComponentByName('validity')
+        cert_not_after = cert_validity.getComponentByName('notAfter')
+        val_end = cert_not_after.getComponentByName('utcTime').asDateTime
+        cert_not_before = cert_validity.getComponentByName('notBefore')
+        val_start = cert_not_before.getComponentByName('utcTime').asDateTime
+
+        if cur_time > val_end or cur_time < val_start:
+            debug_msg = "Certificate attached to OCSP Response is invalid. " \
+                         "OCSP response current time - {0} certificate not " \
+                         "before time - {1} certificate not after time - {2}. ". \
+                         format(cur_time, val_start, val_end)
+            return False, debug_msg
+        else:
+            return True, None
+
+    """
+    is_valid_time - checks various components of the OCSP Response
+    for expiry.
+    :param cert_id - certificate id corresponding to OCSP Response
+    :param ocsp_response
+    :return True/False depending on time validity within the response
+    """
     def is_valid_time(self, cert_id, ocsp_response):
         res = der_decoder.decode(ocsp_response, OCSPResponse())[0]
 
         if res.getComponentByName('responseStatus') != OCSPResponseStatus(
                 'successful'):
-            raise OperationalError(
-                msg="Invalid Status: {0}".format(
-                    res.getComponentByName('response_status')),
-                errno=ER_INVALID_OCSP_RESPONSE)
-
-        response_bytes = res.getComponentByName('responseBytes')
-        basic_ocsp_response = der_decoder.decode(
-            response_bytes.getComponentByName('response'),
-            BasicOCSPResponse())[0]
-
-        tbs_response_data = basic_ocsp_response.getComponentByName(
-            'tbsResponseData')
-
-        single_response = tbs_response_data.getComponentByName('responses')[0]
-        cert_status = single_response.getComponentByName('certStatus')
-        try:
-            if cert_status.getName() == 'good':
-                self._process_good_status(single_response, cert_id, ocsp_response)
-        except Exception as ex:
-            logger.debug("Failed to validate ocsp response %s", ex)
-            return False
-
-        return True
-
-    def process_ocsp_response(self, issuer, cert_id, ocsp_response):
-        try:
-            res = der_decoder.decode(ocsp_response, OCSPResponse())[0]
-        except Exception:
-            raise OperationalError(
-                msg='Invalid OCSP Response',
-                errno=ER_INVALID_OCSP_RESPONSE
-            )
-
-        if res.getComponentByName('responseStatus') != OCSPResponseStatus(
-                'successful'):
-            raise OperationalError(
+            raise RevocationCheckError(
                 msg="Invalid Status: {0}".format(
                     res.getComponentByName('response_status')),
                 errno=ER_INVALID_OCSP_RESPONSE)
@@ -415,26 +403,87 @@ class SnowflakeOCSPPyasn1(SnowflakeOCSP):
 
             cur_time = datetime.utcnow().replace(tzinfo=pytz.utc)
             tbs_certificate = ocsp_cert.getComponentByName('tbsCertificate')
-            cert_validity = tbs_certificate.getComponentByName('validity')
-            cert_not_after = cert_validity.getComponentByName('notAfter')
-            cert_not_after_utc = cert_not_after.getComponentByName('utcTime').asDateTime
-            cert_not_before = cert_validity.getComponentByName('notBefore')
-            cert_not_before_utc = cert_not_before.getComponentByName('utcTime').asDateTime
 
-            if cur_time > cert_not_after_utc or cur_time < cert_not_before_utc:
-                raise OperationalError(
-                    msg="Certificate attached to OCSP Response is invalid. OCSP response "
-                    "current time - {0} "
-                    "certificate not before time - {1} "
-                    "certificate not after time - {2}".format(cur_time, cert_not_before_utc, cert_not_after_utc),
-                    errno=ER_INVALID_OCSP_RESPONSE_CODE
-                )
+            """
+            Note:
+            We purposefully do not verify certificate signature here.
+            The OCSP Response is extracted from the OCSP Response Cache
+            which is expected to have OCSP Responses with verified
+            attached signature. Moreover this OCSP Response is eventually
+            going to be processed by the driver before being consumed by
+            the driver.
+            This step ensures that the OCSP Response cache does not have
+            any invalid entries.
+            """
+
+            cert_valid, debug_msg = self.check_cert_time_validity(cur_time,
+                                                                  tbs_certificate)
+            if not cert_valid:
+                logger.debug(debug_msg)
+                return False
+
+        tbs_response_data = basic_ocsp_response.getComponentByName(
+            'tbsResponseData')
+        single_response = tbs_response_data.getComponentByName('responses')[0]
+        cert_status = single_response.getComponentByName('certStatus')
+        try:
+            if cert_status.getName() == 'good':
+                self._process_good_status(single_response, cert_id, ocsp_response)
+        except Exception as ex:
+            logger.debug("Failed to validate ocsp response %s", ex)
+            return False
+
+        return True
+
+    def process_ocsp_response(self, issuer, cert_id, ocsp_response):
+        try:
+            res = der_decoder.decode(ocsp_response, OCSPResponse())[0]
+        except Exception:
+            raise RevocationCheckError(
+                msg='Invalid OCSP Response',
+                errno=ER_INVALID_OCSP_RESPONSE
+            )
+
+        if res.getComponentByName('responseStatus') != OCSPResponseStatus(
+                'successful'):
+            raise RevocationCheckError(
+                msg="Invalid Status: {0}".format(
+                    res.getComponentByName('response_status')),
+                errno=ER_INVALID_OCSP_RESPONSE)
+
+        response_bytes = res.getComponentByName('responseBytes')
+        basic_ocsp_response = der_decoder.decode(
+            response_bytes.getComponentByName('response'),
+            BasicOCSPResponse())[0]
+
+        attached_certs = basic_ocsp_response.getComponentByName('certs')
+        if self._has_certs_in_ocsp_response(attached_certs):
+            logger.debug("Certificate is attached in Basic OCSP Response")
+            cert_der = der_encoder.encode(attached_certs[0])
+            cert_openssl = load_certificate(FILETYPE_ASN1, cert_der)
+            ocsp_cert = self._convert_openssl_to_pyasn1_certificate(cert_openssl)
+
+            cur_time = datetime.utcnow().replace(tzinfo=pytz.utc)
+            tbs_certificate = ocsp_cert.getComponentByName('tbsCertificate')
+
+            """
+            Signature verification should happen before any kind of
+            validation
+            """
 
             self.verify_signature(
                 ocsp_cert.getComponentByName('signatureAlgorithm'),
                 ocsp_cert.getComponentByName('signatureValue'),
                 issuer,
                 ocsp_cert.getComponentByName('tbsCertificate'))
+
+            cert_valid, debug_msg = self.check_cert_time_validity(cur_time,
+                                                                  tbs_certificate)
+            if not cert_valid:
+                raise RevocationCheckError(
+                    msg=debug_msg,
+                    errno=ER_INVALID_OCSP_RESPONSE_CODE
+                )
         else:
             logger.debug("Certificate is NOT attached in Basic OCSP Response. "
                          "Using issuer's certificate")
@@ -453,19 +502,30 @@ class SnowflakeOCSPPyasn1(SnowflakeOCSP):
 
         single_response = tbs_response_data.getComponentByName('responses')[0]
         cert_status = single_response.getComponentByName('certStatus')
-        if cert_status.getName() == 'good':
-            self._process_good_status(single_response, cert_id, ocsp_response)
-            SnowflakeOCSP.OCSP_CACHE.update_cache(self, cert_id, ocsp_response)
-        elif cert_status.getName() == 'revoked':
-            self._process_revoked_status(single_response, cert_id)
-        elif cert_status.getName() == 'unknown':
-            self._process_unknown_status(cert_id)
-        else:
-            raise OperationalError(
-                msg="Unknown revocation status was returned. OCSP response "
-                    "may be malformed: {0}".format(cert_status),
-                errno=ER_INVALID_OCSP_RESPONSE_CODE
-            )
+        try:
+            if cert_status.getName() == 'good':
+                self._process_good_status(single_response, cert_id, ocsp_response)
+                SnowflakeOCSP.OCSP_CACHE.update_cache(self, cert_id, ocsp_response)
+            elif cert_status.getName() == 'revoked':
+                self._process_revoked_status(single_response, cert_id)
+            elif cert_status.getName() == 'unknown':
+                self._process_unknown_status(cert_id)
+            else:
+                debug_msg = "Unknown revocation status was returned. " \
+                            "OCSP response may be malformed: {0}. ".format(cert_status)
+                raise RevocationCheckError(
+                    msg=debug_msg,
+                    errno=ER_INVALID_OCSP_RESPONSE_CODE)
+        except RevocationCheckError as op_er:
+            if not self.debug_ocsp_failure_url:
+                debug_msg = op_er.msg
+            else:
+                debug_msg = "{0} Consider running curl -o ocsp.der {1}".\
+                    format(op_er.msg,
+                           self.debug_ocsp_failure_url)
+            raise RevocationCheckError(
+                msg=debug_msg,
+                errno=op_er.errno)
 
     def verify_signature(self, signature_algorithm, signature, cert, data):
         """
@@ -499,7 +559,7 @@ class SnowflakeOCSPPyasn1(SnowflakeOCSP):
         data = der_encoder.encode(data)
         digest.update(data)
         if not signer.verify(digest, sig):
-            raise OperationalError(
+            raise RevocationCheckError(
                 msg="Failed to verify the signature",
                 errno=ER_INVALID_OCSP_RESPONSE)
 

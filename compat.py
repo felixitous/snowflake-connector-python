@@ -21,7 +21,7 @@ try:
 
     NUM_DATA_TYPES = [numpy.int8, numpy.int16, numpy.int32, numpy.int64,
                       numpy.float16, numpy.float32, numpy.float64,
-                      numpy.uint8, numpy.uint16, numpy.uint32, numpy.uint64]
+                      numpy.uint8, numpy.uint16, numpy.uint32, numpy.uint64, numpy.bool_]
 except:
     numpy = None
 
@@ -34,10 +34,13 @@ if PY2:
     import httplib
     import Queue
     from HTMLParser import HTMLParser
+    import collections
 
     GET_CWD = os.getcwdu
     BASE_EXCEPTION_CLASS = StandardError  # noqa: F821
     TO_UNICODE = unicode  # noqa: F821
+    ITERATOR = collections.Iterator
+    MAPPING = collections.Mapping
 
     urlsplit = urlparse.urlsplit
     urlunsplit = urlparse.urlunsplit
@@ -75,10 +78,13 @@ else:
     import urllib.request
     import queue
     import html
+    import collections.abc
 
     GET_CWD = os.getcwd
     BASE_EXCEPTION_CLASS = Exception
     TO_UNICODE = str
+    ITERATOR = collections.abc.Iterator
+    MAPPING = collections.abc.Mapping
 
     urlsplit = urllib.parse.urlsplit
     urlunsplit = urllib.parse.urlunsplit

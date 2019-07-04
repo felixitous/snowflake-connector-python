@@ -13,7 +13,7 @@ import platform
 import sys
 import time
 import uuid
-from io import StringIO, BytesIO
+from io import BytesIO
 from threading import Lock
 
 import OpenSSL.SSL
@@ -29,6 +29,7 @@ from snowflake.connector.time_util import get_time_millis
 from . import ssl_wrap_socket
 from .compat import (
     PY2,
+    ITERATOR,
     METHOD_NOT_ALLOWED, BAD_REQUEST, SERVICE_UNAVAILABLE, GATEWAY_TIMEOUT,
     FORBIDDEN, BAD_GATEWAY, REQUEST_TIMEOUT,
     UNAUTHORIZED, INTERNAL_SERVER_ERROR, OK, BadStatusLine)
@@ -46,7 +47,6 @@ from .errors import (Error, OperationalError, DatabaseError, ProgrammingError,
                      InterfaceError, InternalServerError, ForbiddenError,
                      BadGatewayError, BadRequest, MethodNotAllowed,
                      OtherHTTPRetryableError)
-from .gzip_decoder import decompress_raw_data
 from .sqlstate import (SQLSTATE_CONNECTION_NOT_EXISTS,
                        SQLSTATE_CONNECTION_WAS_NOT_ESTABLISHED,
                        SQLSTATE_CONNECTION_REJECTED)
@@ -55,7 +55,6 @@ from .time_util import (
     DEFAULT_MASTER_VALIDITY_IN_SECONDS
 )
 from .tool.probe_connection import probe_connection
-from .util_text import split_rows_from_stream
 from .version import VERSION
 
 if PY2:
@@ -184,7 +183,7 @@ class SnowflakeAuth(AuthBase):
         return r
 
 
-class ResultIterWithTimings(collections.Iterator):
+class ResultIterWithTimings(ITERATOR):
     DOWNLOAD = u"download"
     PARSE = u"parse"
 
@@ -220,13 +219,12 @@ class SnowflakeRestful(object):
         self._idle_sessions = collections.deque()
         self._active_sessions = set()
 
-        # insecure mode (disabled by default)
-        ssl_wrap_socket.FEATURE_INSECURE_MODE = \
-            self._connection and self._connection._insecure_mode
+        # OCSP mode (OCSPMode.FAIL_OPEN by default)
+        ssl_wrap_socket.FEATURE_OCSP_MODE = \
+            self._connection and self._connection._ocsp_mode()
         # cache file name (enabled by default)
         ssl_wrap_socket.FEATURE_OCSP_RESPONSE_CACHE_FILE_NAME = \
             self._connection and self._connection._ocsp_response_cache_filename
-        #
 
         # This is to address the issue where requests hangs
         _ = 'dummy'.encode('idna').decode('utf-8')  # noqa
@@ -739,8 +737,7 @@ class SnowflakeRestful(object):
             catch_okta_unauthorized_error=False,
             is_raw_text=False,
             is_raw_binary=False,
-            is_raw_binary_iterator=True,
-            use_ijson=False,
+            binary_data_handler=None,
             socket_timeout=DEFAULT_SOCKET_CONNECT_TIMEOUT,
             return_timing_metrics=False):
         if socket_timeout > DEFAULT_SOCKET_CONNECT_TIMEOUT:
@@ -785,15 +782,7 @@ class SnowflakeRestful(object):
                         ret = raw_ret.text
                     elif is_raw_binary:
                         start_time = get_time_millis()
-                        raw_data = decompress_raw_data(
-                            raw_ret.raw, add_bracket=True
-                        ).decode('utf-8', 'replace')
-                        if not is_raw_binary_iterator:
-                            ret = json.loads(raw_data)
-                        elif not use_ijson:
-                            ret = iter(json.loads(raw_data))
-                        else:
-                            ret = split_rows_from_stream(StringIO(raw_data))
+                        ret = binary_data_handler.to_iterator(raw_ret.raw)
                         timing_metrics[
                             ResultIterWithTimings.PARSE] = get_time_millis() - start_time
 
@@ -884,22 +873,30 @@ class SnowflakeRestful(object):
         """ Session caching context manager.  Note that the session is not
         closed until close() is called so each session may be used multiple
         times. """
-        try:
-            session = self._idle_sessions.pop()
-        except IndexError:
+        if self._connection.disable_request_pooling:
             session = self.make_requests_session()
-        self._active_sessions.add(session)
-        logger.debug("Active requests sessions: %s, idle: %s",
-                     len(self._active_sessions), len(self._idle_sessions))
-        try:
-            yield session
-        finally:
-            self._idle_sessions.appendleft(session)
             try:
-                self._active_sessions.remove(session)
-            except KeyError:
-                logger.debug(
-                    "session doesn't exist in the active session pool. "
-                    "Ignored...")
+                yield session
+            finally:
+                session.close()
+        else:
+            try:
+                session = self._idle_sessions.pop()
+            except IndexError:
+                session = self.make_requests_session()
+            self._active_sessions.add(session)
             logger.debug("Active requests sessions: %s, idle: %s",
                          len(self._active_sessions), len(self._idle_sessions))
+            try:
+                yield session
+            finally:
+                self._idle_sessions.appendleft(session)
+                try:
+                    self._active_sessions.remove(session)
+                except KeyError:
+                    logger.debug(
+                        "session doesn't exist in the active session pool. "
+                        "Ignored...")
+                logger.debug("Active requests sessions: %s, idle: %s",
+                             len(self._active_sessions),
+                             len(self._idle_sessions))

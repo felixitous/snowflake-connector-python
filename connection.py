@@ -14,6 +14,7 @@ from threading import Lock
 from time import strptime
 import pickle
 
+from .incident import IncidentAPI
 from . import errors
 from . import proxy
 from .auth import Auth
@@ -37,8 +38,9 @@ from .constants import (
     PARAMETER_SERVICE_NAME,
     PARAMETER_CLIENT_STORE_TEMPORARY_CREDENTIAL,
     PARAMETER_CLIENT_PREFETCH_THREADS,
+    OCSPMode
 )
-from .cursor import SnowflakeCursor
+from .cursor import SnowflakeCursor, LOG_MAX_QUERY_LENGTH
 from .errorcode import (ER_CONNECTION_IS_CLOSED,
                         ER_NO_ACCOUNT_NAME, ER_OLD_PYTHON, ER_NO_USER,
                         ER_NO_PASSWORD, ER_INVALID_VALUE,
@@ -65,7 +67,9 @@ from .telemetry import (TelemetryClient)
 from .time_util import (
     DEFAULT_MASTER_VALIDITY_IN_SECONDS,
     HeartBeatTimer, get_time_millis)
-from .util_text import split_statements, construct_hostname
+from .util_text import split_statements, construct_hostname, parse_account
+
+from snowflake.connector.network import APPLICATION_SNOWSQL
 
 
 def DefaultConverterClass():
@@ -116,6 +120,7 @@ DEFAULT_CONFIGURATION = {
     u'internal_application_version': CLIENT_VERSION,
 
     u'insecure_mode': False,  # Error security fix requirement
+    u'ocsp_fail_open': True,  # fail open on ocsp issues, default true
     u'inject_client_pause': 0,  # snowflake internal
     u'session_parameters': None,  # snowflake session parameters
     u'autocommit': None,  # snowflake
@@ -132,7 +137,9 @@ DEFAULT_CONFIGURATION = {
     u'timezone': None,  # snowflake
     u'consent_cache_id_token': True,  # snowflake
     u'service_name': None,  # snowflake,
-    u'support_negative_year': True  # snowflake
+    u'support_negative_year': True,  # snowflake
+    u'log_max_query_length': LOG_MAX_QUERY_LENGTH,  # snowflake
+    u'disable_request_pooling': False,  # snowflake
 }
 
 APPLICATION_RE = re.compile(r'[\w\d_]+')
@@ -176,6 +183,7 @@ class SnowflakeConnection(object):
         self.connect(**kwargs)
         self._telemetry = TelemetryClient(self._rest)
         self.telemetry_enabled = False
+        self.incident = IncidentAPI(self._rest)
 
     def __del__(self):
         try:
@@ -191,6 +199,25 @@ class SnowflakeConnection(object):
         :return:
         """
         return self._insecure_mode
+
+    @property
+    def ocsp_fail_open(self):
+        u"""
+        fail open mode. TLS cerificates continue to be validated. Revoked
+        certificates are blocked. Any other exceptions are disregarded.
+        :return:
+        """
+        return self._ocsp_fail_open
+
+    def _ocsp_mode(self):
+        """
+        OCSP mode. INSECURE, FAIL_OPEN or FAIL_CLOSED
+        :return:
+        """
+        if self.insecure_mode:
+            return OCSPMode.INSECURE
+        return OCSPMode.FAIL_OPEN \
+            if self.ocsp_fail_open else OCSPMode.FAIL_CLOSED
 
     @property
     def session_id(self):
@@ -428,6 +455,18 @@ class SnowflakeConnection(object):
     def service_name(self, value):
         self._service_name = value
 
+    @property
+    def log_max_query_length(self):
+        return self._log_max_query_length
+
+    @property
+    def disable_request_pooling(self):
+        return self._disable_request_pooling
+
+    @disable_request_pooling.setter
+    def disable_request_pooling(self, value):
+        self._disable_request_pooling = True if value else False
+
     def connect(self, **kwargs):
         u"""
         Connects to the database
@@ -563,6 +602,33 @@ class SnowflakeConnection(object):
                   callable(getattr(errors, method))]:
             setattr(self, m, getattr(errors, m))
 
+    @staticmethod
+    def setup_ocsp_privatelink(app, hostname):
+        if app == APPLICATION_SNOWSQL:
+            ocsp_cache_server = u'http://ocsp{}/ocsp_response_cache.json'.format(
+                hostname[hostname.index('.'):])
+        else:
+            ocsp_cache_server = \
+                u'http://ocsp.{}/ocsp_response_cache.json'.format(
+                    hostname)
+        if 'SF_OCSP_RESPONSE_CACHE_SERVER_URL' not in os.environ:
+            os.environ[
+                'SF_OCSP_RESPONSE_CACHE_SERVER_URL'] = ocsp_cache_server
+        else:
+            if not os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL']. \
+                    startswith("http://"):
+                ocsp_cache_server = "http://{0}/{1}".format(
+                    os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL'],
+                    "ocsp_response_cache.json")
+            else:
+                ocsp_cache_server = "{0}/{1}".format(
+                    os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL'],
+                    "ocsp_response_cache.json")
+
+            os.environ[
+                'SF_OCSP_RESPONSE_CACHE_SERVER_URL'] = ocsp_cache_server
+        logger.debug(u"OCSP Cache Server is updated: %s", ocsp_cache_server)
+
     def __open_connection(self):
         u"""
         Opens a new network connection
@@ -585,12 +651,13 @@ class SnowflakeConnection(object):
                      self.host,
                      self.port)
 
+        if 'SF_OCSP_RESPONSE_CACHE_SERVER_URL' in os.environ:
+            logger.debug(
+                u"Custom OCSP Cache Server URL found in environment - %s",
+                os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL'])
+
         if self.host.endswith(u".privatelink.snowflakecomputing.com"):
-            ocsp_cache_server = \
-                u'http://ocsp{}/ocsp_response_cache.json'.format(
-                    self.host[self.host.index('.'):])
-            os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL'] = ocsp_cache_server
-            logger.debug(u"OCSP Cache Server is updated: %s", ocsp_cache_server)
+            SnowflakeConnection.setup_ocsp_privatelink(self.application, self.host)
         else:
             if 'SF_OCSP_RESPONSE_CACHE_SERVER_URL' in os.environ:
                 del os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL']
@@ -723,8 +790,16 @@ class SnowflakeConnection(object):
                     u'errno': ER_NO_ACCOUNT_NAME
                 })
         if u'.' in self._account:
-            # remove region subdomain
-            self._account = self._account[0:self._account.find(u'.')]
+            self._account = parse_account(self._account)
+
+        if self.ocsp_fail_open:
+            logger.info(
+                u'This connection is in OCSP Fail Open Mode. '
+                u'TLS Certificates would be checked for validity '
+                u'and revocation status. Any other Certificate '
+                u'Revocation related exceptions or OCSP Responder '
+                u'failures would be disregarded in favor of '
+                u'connectivity.')
 
         if self.insecure_mode:
             logger.info(
@@ -732,6 +807,7 @@ class SnowflakeConnection(object):
                 u'MEANS THE CERTIFICATE WILL BE VALIDATED BUT THE '
                 u'CERTIFICATE REVOCATION STATUS WILL NOT BE '
                 u'CHECKED.')
+
         elif self._protocol == u'https':
             if IS_OLD_PYTHON():
                 msg = (u"ERROR: The ssl package installed with your Python "
@@ -770,9 +846,7 @@ class SnowflakeConnection(object):
         if logger.getEffectiveLevel() <= logging.DEBUG:
             logger.debug(
                 u'sql=[%s], sequence_id=[%s], is_file_transfer=[%s]',
-                u' '.join(
-                    line.strip() for line in
-                    data[u'sqlText'].split(u'\n')),
+                self._format_query_for_log(data[u'sqlText']),
                 data[u'sequenceId'],
                 is_file_transfer
             )
@@ -1113,6 +1187,11 @@ class SnowflakeConnection(object):
                 self.service_name = value
             elif PARAMETER_CLIENT_PREFETCH_THREADS == name:
                 self.client_prefetch_threads = value
+
+    def _format_query_for_log(self, query):
+        ret = u' '.join(line.strip() for line in query.split(u'\n'))
+        return (ret if len(ret) < self.log_max_query_length
+                else ret[0:self.log_max_query_length] + '...')
 
     def __enter__(self):
         u"""

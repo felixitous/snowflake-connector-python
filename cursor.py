@@ -10,7 +10,7 @@ import sys
 import uuid
 from logging import getLogger
 from threading import (Timer, Lock)
-
+from base64 import b64decode
 from six import u
 
 from .compat import (BASE_EXCEPTION_CLASS)
@@ -30,6 +30,13 @@ from .file_transfer_agent import (SnowflakeFileTransferAgent)
 from .sqlstate import (SQLSTATE_FEATURE_NOT_SUPPORTED)
 from .telemetry import (TelemetryData, TelemetryField)
 from .time_util import get_time_millis
+from .chunk_downloader import ArrowChunkIterator
+from .converter_arrow import SnowflakeArrowConverter
+
+try:
+    from pyarrow.ipc import open_stream
+except ImportError:
+    pass
 
 STATEMENT_TYPE_ID_DML = 0x3000
 STATEMENT_TYPE_ID_INSERT = STATEMENT_TYPE_ID_DML + 0x100
@@ -49,6 +56,8 @@ DESC_TABLE_RE = re.compile(u(r'desc(?:ribe)?\s+([\w_]+)\s*;?\s*$'),
 
 logger = getLogger(__name__)
 
+LOG_MAX_QUERY_LENGTH = 80
+
 
 class SnowflakeCursor(object):
     u"""
@@ -64,8 +73,6 @@ class SnowflakeCursor(object):
     ALTER_SESSION_RE = re.compile(
         u(r'alter\s+session\s+set\s+(.*)=\'?([^\']+)\'?\s*;'),
         flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
-
-    LOG_MAX_QUERY_LENGTH = 80
 
     def __init__(self, connection):
         self._connection = connection
@@ -96,6 +103,8 @@ class SnowflakeCursor(object):
         self._lock_canceling = Lock()
 
         self._first_chunk_time = None
+
+        self._log_max_query_length = connection.log_max_query_length
 
         self.reset()
 
@@ -303,9 +312,7 @@ class SnowflakeCursor(object):
 
         if logger.getEffectiveLevel() <= logging.DEBUG:
             logger.debug(
-                u'running query [%s]',
-                u' '.join(line.strip() for line in query.split(u'\n')),
-            )
+                u'running query [%s]', self._format_query_for_log(query))
         if _is_put_get is not None:
             # if told the query is PUT or GET, use the information
             self._is_file_transfer = _is_put_get
@@ -375,6 +382,9 @@ class SnowflakeCursor(object):
                 logger.debug(
                     u'Failed to reset SIGINT handler. Not in main '
                     u'thread. Ignored...')
+            except Exception:
+                self.connection.incident.report_incident()
+                raise
             if self._timebomb is not None:
                 self._timebomb.cancel()
                 logger.debug(u'cancelled timebomb in finally')
@@ -437,24 +447,31 @@ class SnowflakeCursor(object):
             logger.warning(u'execute: no query is given to execute')
             return
 
-        if self._connection.is_pyformat:
-            # pyformat/format paramstyle
-            # client side binding
-            processed_params = self._connection._process_params(params, self)
-            logger.debug(u'binding: %s with input=%s, processed=%s',
-                         command,
-                         params, processed_params)
-            if len(processed_params) > 0:
-                query = command % processed_params
+        try:
+            if self._connection.is_pyformat:
+                # pyformat/format paramstyle
+                # client side binding
+                processed_params = self._connection._process_params(params, self)
+                if logger.getEffectiveLevel() <= logging.DEBUG:
+                    logger.debug(u'binding: [%s] with input=[%s], processed=[%s]',
+                                 self._format_query_for_log(command),
+                                 params, processed_params)
+                if len(processed_params) > 0:
+                    query = command % processed_params
+                else:
+                    query = command
+                processed_params = None  # reset to None
             else:
+                # qmark and numeric paramstyle
+                # server side binding
                 query = command
-            processed_params = None  # reset to None
-        else:
-            # qmark and numeric paramstyle
-            # server side binding
-            query = command
-            processed_params = self._connection._process_params_qmarks(
-                params, self)
+                processed_params = self._connection._process_params_qmarks(
+                    params, self)
+        except ValueError:
+            raise
+        except Exception:
+            self.connection.incident.report_incident()
+            raise
 
         m = DESC_TABLE_RE.match(query)
         if m:
@@ -551,9 +568,7 @@ class SnowflakeCursor(object):
         return self
 
     def _format_query_for_log(self, query):
-        ret = u' '.join(line.strip() for line in query.split(u'\n'))
-        return (ret if len(ret) < SnowflakeCursor.LOG_MAX_QUERY_LENGTH
-                else ret[0:SnowflakeCursor.LOG_MAX_QUERY_LENGTH] + '...')
+        return self._connection._format_query_for_log(query)
 
     def _is_dml(self, data):
         return u'statementTypeId' in data \
@@ -562,6 +577,7 @@ class SnowflakeCursor(object):
 
     def chunk_info(self, data, use_ijson=False):
         is_dml = self._is_dml(data)
+        self._query_result_format = data.get(u'queryResultFormat', u'json')
 
         if self._total_rowcount == -1 and not is_dml and data.get(u'total') \
                 is not None:
@@ -570,6 +586,10 @@ class SnowflakeCursor(object):
         self._description = []
         self._column_idx_to_name = {}
         self._column_converter = []
+
+        converter = SnowflakeArrowConverter() if \
+            self._query_result_format == 'arrow' else self._connection.converter
+
         for idx, column in enumerate(data[u'rowtype']):
             self._column_idx_to_name[idx] = column[u'name']
             type_value = FIELD_NAME_TO_ID[column[u'type'].upper()]
@@ -581,15 +601,21 @@ class SnowflakeCursor(object):
                                       column[u'scale'],
                                       column[u'nullable']))
             self._column_converter.append(
-                self._connection.converter.to_python_method(
-                    column[u'type'].upper(), column))
+                    converter.to_python_method(
+                        column[u'type'].upper(), column))
 
         self._total_row_index = -1  # last fetched number of rows
 
         self._chunk_index = 0
         self._chunk_count = 0
-        self._current_chunk_row = iter(data.get(u'rowset'))
-        self._current_chunk_row_count = len(data.get(u'rowset'))
+        if self._query_result_format == 'arrow':
+            # result as arrow chunk
+            arrow_bytes = b64decode(data.get(u'rowsetBase64'))
+            arrow_reader = open_stream(arrow_bytes)
+            self._current_chunk_row = ArrowChunkIterator(arrow_reader)
+        else:
+            self._current_chunk_row = iter(data.get(u'rowset'))
+            self._current_chunk_row_count = len(data.get(u'rowset'))
 
         if u'chunks' in data:
             chunks = data[u'chunks']
@@ -611,6 +637,7 @@ class SnowflakeCursor(object):
             logger.debug(u'qrmk=%s', qrmk)
             self._chunk_downloader = self._connection._chunk_downloader_class(
                 chunks, self._connection, self, qrmk, chunk_headers,
+                query_result_format=self._query_result_format,
                 prefetch_threads=self._connection.client_prefetch_threads,
                 use_ijson=use_ijson)
 

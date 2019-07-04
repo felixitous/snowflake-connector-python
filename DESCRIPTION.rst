@@ -9,6 +9,48 @@ Source code is also available at: https://github.com/snowflakedb/snowflake-conne
 Release Notes
 -------------------------------------------------------------------------------
 
+- v1.8.4(July 01,2019)
+
+    - Update Python Connector to discard invalid OCSP Responses while merging caches
+
+- v1.8.3(June 17,2019)
+
+    - Update Client Driver OCSP Endpoint URL for Private Link Customers
+    - Ignore session gone 390111 when closing
+    - Python3.4 using requests 2.21.0 needs older version of urllib3
+    - Use Account Name for Global URL
+
+- v1.8.2 (June 03,2019)
+
+    - Pendulum datatype support
+
+- v1.8.1 (May 20,2019)
+
+    - Revoked OCSP Responses persists in Driver Cache + Logging Fix
+    - Fixed DeprecationWarning: Using or importing the ABCs from 'collections' instead of from 'collections.abc' is deprecated
+
+- v1.8.0 (May 10, 2019)
+
+    - support ``numpy.bool_`` in binding type
+    - Add Option to Skip Request Pooling
+    - Add OCSP_MODE metric
+    - Fixed PUT URI issue for Windows path
+    - OCSP SoftFail 
+
+- v1.7.11 (April 22, 2019)
+
+    - numpy timestamp with timezone support
+    - qmark not binding None
+ 
+- v1.7.10 (April 8, 2019)
+
+    - Fix the incorrect custom Server URL in Python Driver for Privatelink
+
+- v1.7.9 (March 25,2019)
+
+    - Python Interim Solution for Custom Cache Server URL
+    - Internal change for pending feature
+
 - v1.7.8 (March 12,2019)
 
     - Add OCSP signing certificate validity check

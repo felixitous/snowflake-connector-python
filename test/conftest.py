@@ -14,7 +14,6 @@ from io import open
 from logging import getLogger
 
 import pytest
-
 from parameters import CONNECTION_PARAMETERS
 
 try:
@@ -56,6 +55,8 @@ DEFAULT_PARAMETERS = {
     'host': '<host>',
     'port': '443',
 }
+
+IS_PUBLIC_CI = os.getenv('TRAVIS') == 'true' or os.getenv('APPVEYOR') == 'True'
 
 
 def help():
@@ -125,6 +126,8 @@ def get_db_parameters():
     ret['name_wh'] = ret['name'] + 'wh'
 
     ret['schema'] = TEST_SCHEMA
+
+    # This reduces a chance to exposing password in test output.
     ret['a00'] = 'dummy parameter'
     ret['a01'] = 'dummy parameter'
     ret['a02'] = 'dummy parameter'
@@ -295,6 +298,21 @@ def db(**kwargs):
         cnx.close()
 
 
+@contextmanager
+def negative_db(**kwargs):
+    if not kwargs.get(u'timezone'):
+        kwargs[u'timezone'] = u'UTC'
+    if not kwargs.get(u'converter_class'):
+        kwargs[u'converter_class'] = DefaultConverterClass()
+    cnx = create_connection(**kwargs)
+    if not IS_PUBLIC_CI:
+        cnx.cursor().execute("alter session set SUPPRESS_INCIDENT_DUMPS=true")
+    try:
+        yield cnx
+    finally:
+        cnx.close()
+
+
 @pytest.fixture()
 def conn_testaccount(request):
     connection = create_connection()
@@ -312,5 +330,19 @@ def conn_cnx():
 
 
 @pytest.fixture()
+def negative_conn_cnx():
+    """
+    Use this if an incident is expected and we don't want GS to create a
+    dump file about the incident"""
+    return negative_db
+
+
+@pytest.fixture()
 def test_files():
     return generate_k_lines_of_n_files
+
+
+def pytest_runtest_setup(item):
+    for _ in item.iter_markers(name="internal"):
+        if IS_PUBLIC_CI:
+            pytest.skip("cannot run on public CI")

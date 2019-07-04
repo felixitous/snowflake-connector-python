@@ -19,6 +19,9 @@ try:
 except:
     CONNECTION_PARAMETERS_ADMIN = {}
 
+from snowflake.connector.network import APPLICATION_SNOWSQL, CLIENT_NAME
+from snowflake.connector.connection import SnowflakeConnection
+
 
 def test_basic(conn_testaccount):
     """
@@ -276,6 +279,9 @@ def test_valid_application(db_parameters):
     cnx.close()
 
 
+@pytest.mark.skipif(True,
+    reason="Disable temporarily"
+)
 def test_invalid_default_parameters(db_parameters):
     """
     Invalid database, schema, warehouse and role name
@@ -382,10 +388,8 @@ def test_drop_create_user(conn_cnx, db_parameters):
 
         exe('use role snowdog_role')
         exe(u"use {0}".format(db_parameters['database']))
-        exe(
-            u"use schema {0}".format(db_parameters['schema']))
-        exe(
-            'create or replace table friends(name varchar(100))')
+        exe(u"use schema {0}".format(db_parameters['schema']))
+        exe('create or replace table friends(name varchar(100))')
         exe('drop table friends')
     with conn_cnx() as cnx:
         def exe(sql):
@@ -490,6 +494,8 @@ def test_privatelink(db_parameters):
     connection is used.
     """
     try:
+        os.environ['SF_OCSP_FAIL_OPEN'] = 'false'
+        os.environ['SF_OCSP_DO_RETRY'] = 'false'
         snowflake.connector.connect(
             account='testaccount',
             user='testuser',
@@ -501,10 +507,9 @@ def test_privatelink(db_parameters):
     except OperationalError:
         ocsp_url = os.getenv('SF_OCSP_RESPONSE_CACHE_SERVER_URL')
         assert ocsp_url is not None, "OCSP URL should not be None"
-        assert ocsp_url.endswith(
-            'eu-central-1.privatelink.snowflakecomputing.com'
-            '/ocsp_response_cache.json')
-        assert ocsp_url.startswith('http://ocsp')
+        assert ocsp_url == "http://ocsp.testaccount.eu-central-1." \
+                           "privatelink.snowflakecomputing.com/" \
+                           "ocsp_response_cache.json"
 
     cnx = snowflake.connector.connect(
         user=db_parameters['user'],
@@ -520,3 +525,45 @@ def test_privatelink(db_parameters):
 
     ocsp_url = os.getenv('SF_OCSP_RESPONSE_CACHE_SERVER_URL')
     assert ocsp_url is None, "OCSP URL should be None: {0}".format(ocsp_url)
+    del os.environ['SF_OCSP_DO_RETRY']
+    del os.environ['SF_OCSP_FAIL_OPEN']
+
+
+def test_disable_request_pooling(db_parameters):
+    """
+    Creates a connection with client_session_keep_alive parameter.
+    """
+    config = {
+        'user': db_parameters['user'],
+        'password': db_parameters['password'],
+        'host': db_parameters['host'],
+        'port': db_parameters['port'],
+        'account': db_parameters['account'],
+        'schema': db_parameters['schema'],
+        'database': db_parameters['database'],
+        'protocol': db_parameters['protocol'],
+        'timezone': 'UTC',
+        'disable_request_pooling': True
+    }
+    cnx = snowflake.connector.connect(**config)
+    try:
+        assert cnx.disable_request_pooling
+    finally:
+        cnx.close()
+
+
+def test_privatelink_ocsp_url_creation():
+    hostname = "testaccount.us-east-1.privatelink.snowflakecomputing.com"
+    SnowflakeConnection.setup_ocsp_privatelink(APPLICATION_SNOWSQL, hostname)
+
+    ocsp_cache_server = os.getenv("SF_OCSP_RESPONSE_CACHE_SERVER_URL", None)
+    assert ocsp_cache_server == \
+        "http://ocsp.us-east-1.privatelink.snowflakecomputing.com/ocsp_response_cache.json"
+
+    del os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL']
+
+    SnowflakeConnection.setup_ocsp_privatelink(CLIENT_NAME, hostname)
+    ocsp_cache_server = os.getenv("SF_OCSP_RESPONSE_CACHE_SERVER_URL", None)
+    assert ocsp_cache_server == \
+        "http://ocsp.testaccount.us-east-1.privatelink.snowflakecomputing.com/ocsp_response_cache.json"
+

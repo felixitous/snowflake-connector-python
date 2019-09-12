@@ -7,6 +7,8 @@
 import os
 
 import pytest
+import threading
+import queue
 
 import snowflake.connector
 from snowflake.connector import (
@@ -19,7 +21,8 @@ try:
 except:
     CONNECTION_PARAMETERS_ADMIN = {}
 
-from snowflake.connector.network import APPLICATION_SNOWSQL, CLIENT_NAME
+from snowflake.connector.description import CLIENT_NAME
+from snowflake.connector.network import APPLICATION_SNOWSQL
 from snowflake.connector.connection import SnowflakeConnection
 
 
@@ -279,9 +282,6 @@ def test_valid_application(db_parameters):
     cnx.close()
 
 
-@pytest.mark.skipif(True,
-    reason="Disable temporarily"
-)
 def test_invalid_default_parameters(db_parameters):
     """
     Invalid database, schema, warehouse and role name
@@ -469,7 +469,7 @@ def test_eu_connection(tmpdir):
         )
 
 
-@pytest.mark.timeout(15)
+#@pytest.mark.timeout(15)
 def test_us_west_connection(tmpdir):
     """
     region='us-west-2' indicates no region is included in the hostname, i.e.,
@@ -487,7 +487,7 @@ def test_us_west_connection(tmpdir):
         )
 
 
-@pytest.mark.timeout(15)
+@pytest.mark.timeout(60)
 def test_privatelink(db_parameters):
     """
     Ensure the OCSP cache server URL is overridden if privatelink
@@ -558,7 +558,7 @@ def test_privatelink_ocsp_url_creation():
 
     ocsp_cache_server = os.getenv("SF_OCSP_RESPONSE_CACHE_SERVER_URL", None)
     assert ocsp_cache_server == \
-        "http://ocsp.us-east-1.privatelink.snowflakecomputing.com/ocsp_response_cache.json"
+        "http://ocsp.testaccount.us-east-1.privatelink.snowflakecomputing.com/ocsp_response_cache.json"
 
     del os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL']
 
@@ -567,3 +567,71 @@ def test_privatelink_ocsp_url_creation():
     assert ocsp_cache_server == \
         "http://ocsp.testaccount.us-east-1.privatelink.snowflakecomputing.com/ocsp_response_cache.json"
 
+
+def test_privatelink_ocsp_url_multithreaded():
+    bucket = queue.Queue()
+
+    hostname = "testaccount.us-east-1.privatelink.snowflakecomputing.com"
+    expectation = "http://ocsp.testaccount.us-east-1.privatelink.snowflakecomputing.com/ocsp_response_cache.json"
+    thread_obj = []
+    for i in range(15):
+        thread_obj.append(ExecPrivatelinkThread(bucket, hostname, expectation, CLIENT_NAME))
+
+    for i in range(15):
+        thread_obj[i].start()
+
+    fail_flag = False
+    for i in range(15):
+        thread_obj[i].join()
+        exc = bucket.get(block=False)
+        if exc != 'Success' and not fail_flag:
+            fail_flag = True
+
+    if fail_flag:
+        assert False, "OCSP URL was set incorrectly"
+
+    if os.getenv("SF_OCSP_RESPONSE_CACHE_SERVER_URL", None) is not None:
+        del os.environ["SF_OCSP_RESPONSE_CACHE_SERVER_URL"]
+
+
+def test_privatelink_ocsp_url_multithreaded_snowsql():
+    bucket = queue.Queue()
+
+    hostname = "testaccount.us-east-1.privatelink.snowflakecomputing.com"
+    expectation = "http://ocsp.testaccount.us-east-1.privatelink.snowflakecomputing.com/ocsp_response_cache.json"
+    thread_obj = []
+    for i in range(15):
+        thread_obj.append(ExecPrivatelinkThread(bucket, hostname, expectation, APPLICATION_SNOWSQL))
+
+    for i in range(15):
+        thread_obj[i].start()
+
+    fail_flag = False
+    for i in range(15):
+        thread_obj[i].join()
+        exc = bucket.get(block=False)
+        if exc != 'Success' and not fail_flag:
+            fail_flag = True
+
+    if fail_flag:
+        assert False, "OCSP URL was set incorrectly"
+
+
+class ExecPrivatelinkThread(threading.Thread):
+
+    def __init__(self, bucket, hostname, expectation, client_name):
+        threading.Thread.__init__(self)
+        self.bucket = bucket
+        self.hostname = hostname
+        self.expectation = expectation
+        self.client_name = client_name
+
+    def run(self):
+        SnowflakeConnection.setup_ocsp_privatelink(self.client_name, self.hostname)
+        ocsp_cache_server = os.getenv("SF_OCSP_RESPONSE_CACHE_SERVER_URL", None)
+        if ocsp_cache_server is not None and ocsp_cache_server !=\
+                self.expectation:
+            print("Got {0} Expected {1}".format(ocsp_cache_server, self.expectation))
+            self.bucket.put("Fail")
+        else:
+            self.bucket.put("Success")

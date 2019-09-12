@@ -34,13 +34,22 @@ from .constants import (
     PARAMETER_CLIENT_SESSION_KEEP_ALIVE_HEARTBEAT_FREQUENCY,
     PARAMETER_CLIENT_SESSION_KEEP_ALIVE,
     PARAMETER_CLIENT_TELEMETRY_ENABLED,
+    PARAMETER_CLIENT_TELEMETRY_OOB_ENABLED,
     PARAMETER_TIMEZONE,
     PARAMETER_SERVICE_NAME,
     PARAMETER_CLIENT_STORE_TEMPORARY_CREDENTIAL,
     PARAMETER_CLIENT_PREFETCH_THREADS,
+    PARAMETER_CLIENT_VALIDATE_DEFAULT_PARAMETERS,
     OCSPMode
 )
 from .cursor import SnowflakeCursor, LOG_MAX_QUERY_LENGTH
+from .description import (
+    SNOWFLAKE_CONNECTOR_VERSION,
+    PYTHON_VERSION,
+    PLATFORM,
+    CLIENT_NAME,
+    CLIENT_VERSION
+)
 from .errorcode import (ER_CONNECTION_IS_CLOSED,
                         ER_NO_ACCOUNT_NAME, ER_OLD_PYTHON, ER_NO_USER,
                         ER_NO_PASSWORD, ER_INVALID_VALUE,
@@ -49,11 +58,6 @@ from .errorcode import (ER_CONNECTION_IS_CLOSED,
 from .errors import (Error, ProgrammingError, InterfaceError,
                      DatabaseError)
 from .network import (
-    SNOWFLAKE_CONNECTOR_VERSION,
-    PYTHON_VERSION,
-    PLATFORM,
-    CLIENT_NAME,
-    CLIENT_VERSION,
     DEFAULT_AUTHENTICATOR,
     EXTERNAL_BROWSER_AUTHENTICATOR,
     KEY_PAIR_AUTHENTICATOR,
@@ -64,12 +68,11 @@ from .network import (
 from .sqlstate import (SQLSTATE_CONNECTION_NOT_EXISTS,
                        SQLSTATE_FEATURE_NOT_SUPPORTED)
 from .telemetry import (TelemetryClient)
+from .telemetry_oob import TelemetryService
 from .time_util import (
     DEFAULT_MASTER_VALIDITY_IN_SECONDS,
     HeartBeatTimer, get_time_millis)
 from .util_text import split_statements, construct_hostname, parse_account
-
-from snowflake.connector.network import APPLICATION_SNOWSQL
 
 
 def DefaultConverterClass():
@@ -160,6 +163,8 @@ class SnowflakeConnection(object):
     Implementation of the connection object for the Snowflake Database. Use
     connect(..) to get the object.
     """
+
+    OCSP_ENV_LOCK = Lock()
 
     def __init__(self, **kwargs):
         self._lock_sequence_counter = Lock()
@@ -474,6 +479,7 @@ class SnowflakeConnection(object):
         logger.debug(u'connect')
         if len(kwargs) > 0:
             self.__config(**kwargs)
+            TelemetryService.get_instance().update_context(kwargs)
 
         self.__set_error_attributes()
         self.__open_connection()
@@ -604,30 +610,14 @@ class SnowflakeConnection(object):
 
     @staticmethod
     def setup_ocsp_privatelink(app, hostname):
-        if app == APPLICATION_SNOWSQL:
-            ocsp_cache_server = u'http://ocsp{}/ocsp_response_cache.json'.format(
-                hostname[hostname.index('.'):])
-        else:
-            ocsp_cache_server = \
-                u'http://ocsp.{}/ocsp_response_cache.json'.format(
-                    hostname)
-        if 'SF_OCSP_RESPONSE_CACHE_SERVER_URL' not in os.environ:
-            os.environ[
-                'SF_OCSP_RESPONSE_CACHE_SERVER_URL'] = ocsp_cache_server
-        else:
-            if not os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL']. \
-                    startswith("http://"):
-                ocsp_cache_server = "http://{0}/{1}".format(
-                    os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL'],
-                    "ocsp_response_cache.json")
-            else:
-                ocsp_cache_server = "{0}/{1}".format(
-                    os.environ['SF_OCSP_RESPONSE_CACHE_SERVER_URL'],
-                    "ocsp_response_cache.json")
-
-            os.environ[
-                'SF_OCSP_RESPONSE_CACHE_SERVER_URL'] = ocsp_cache_server
+        SnowflakeConnection.OCSP_ENV_LOCK.acquire()
+        ocsp_cache_server = \
+            u'http://ocsp.{}/ocsp_response_cache.json'.format(
+                hostname)
+        os.environ[
+            'SF_OCSP_RESPONSE_CACHE_SERVER_URL'] = ocsp_cache_server
         logger.debug(u"OCSP Cache Server is updated: %s", ocsp_cache_server)
+        SnowflakeConnection.OCSP_ENV_LOCK.release()
 
     def __open_connection(self):
         u"""
@@ -683,6 +673,10 @@ class SnowflakeConnection(object):
 
         if self._timezone is not None:
             self._session_parameters[PARAMETER_TIMEZONE] = self._timezone
+
+        if self._validate_default_parameters:
+            # Snowflake will validate the requested database, schema, and warehouse
+            self._session_parameters[PARAMETER_CLIENT_VALIDATE_DEFAULT_PARAMETERS] = True
 
         if self.client_session_keep_alive:
             self._session_parameters[PARAMETER_CLIENT_SESSION_KEEP_ALIVE] = True
@@ -1178,6 +1172,11 @@ class SnowflakeConnection(object):
             session_parameters[name] = value
             if PARAMETER_CLIENT_TELEMETRY_ENABLED == name:
                 self.telemetry_enabled = value
+            elif PARAMETER_CLIENT_TELEMETRY_OOB_ENABLED == name:
+                if value:
+                    TelemetryService.get_instance().enable()
+                else:
+                    TelemetryService.get_instance().disable()
             elif PARAMETER_CLIENT_SESSION_KEEP_ALIVE == name:
                 self.client_session_keep_alive = value
             elif PARAMETER_CLIENT_SESSION_KEEP_ALIVE_HEARTBEAT_FREQUENCY == \

@@ -6,6 +6,7 @@
 
 import codecs
 import copy
+from datetime import datetime
 import json
 import logging
 import platform
@@ -17,6 +18,7 @@ from os.path import expanduser
 from threading import Lock
 from threading import Thread
 
+from .auth_keypair import AuthByKeyPair
 from .compat import (TO_UNICODE, urlencode, IS_LINUX)
 from .constants import (
     HTTP_HEADER_CONTENT_TYPE,
@@ -24,9 +26,16 @@ from .constants import (
     HTTP_HEADER_USER_AGENT,
     HTTP_HEADER_SERVICE_NAME,
     PARAMETER_CLIENT_STORE_TEMPORARY_CREDENTIAL,
-    PARAMETER_CLIENT_USE_SECURE_STORAGE_FOR_TEMPORARY_CREDENTIAL,
+    PARAMETER_CLIENT_USE_SECURE_STORAGE_FOR_TEMPORARY_CREDENTIAL
 )
-from .errorcode import (ER_FAILED_TO_CONNECT_TO_DB, ER_INVALID_VALUE)
+from .description import (
+    OPERATING_SYSTEM,
+    PYTHON_VERSION,
+    PLATFORM,
+    IMPLEMENTATION,
+    COMPILER
+)
+from .errorcode import (ER_FAILED_TO_CONNECT_TO_DB)
 from .errors import (Error,
                      DatabaseError,
                      ServiceUnavailableError,
@@ -35,10 +44,6 @@ from .errors import (Error,
 from .network import (CONTENT_TYPE_APPLICATION_JSON,
                       ACCEPT_TYPE_APPLICATION_SNOWFLAKE,
                       PYTHON_CONNECTOR_USER_AGENT,
-                      OPERATING_SYSTEM,
-                      PLATFORM,
-                      PYTHON_VERSION,
-                      IMPLEMENTATION, COMPILER,
                       ReauthenticationRequest)
 from .sqlstate import (SQLSTATE_CONNECTION_WAS_NOT_ESTABLISHED)
 from .version import VERSION
@@ -81,42 +86,6 @@ TEMPORARY_CREDENTIAL_FILE_LOCK = TEMPORARY_CREDENTIAL_FILE + ".lck"
 # keyring
 KEYRING_SERVICE_NAME = "net.snowflake.temporary_token"
 KEYRING_USER = "temp_token"
-
-
-class AuthByPlugin(object):
-    """
-    External Authenticator interface.
-    """
-
-    @property
-    def assertion_content(self):
-        raise NotImplementedError
-
-    def update_body(self, body):
-        raise NotImplementedError
-
-    def authenticate(
-            self, authenticator, service_name, account, user, password):
-        raise NotImplementedError
-
-    def handle_failure(self, ret):
-        """ Handles a failure when connecting to Snowflake
-
-        Args:
-            ret: dictionary returned from Snowflake.
-        """
-        Error.errorhandler_wrapper(
-            self._rest._connection, None, DatabaseError,
-            {
-                u'msg': (u"Failed to connect to DB: {host}:{port}, "
-                         u"{message}").format(
-                    host=self._rest._host,
-                    port=self._rest._port,
-                    message=ret[u'message'],
-                ),
-                u'errno': int(ret.get(u'code', -1)),
-                u'sqlstate': SQLSTATE_CONNECTION_WAS_NOT_ESTABLISHED,
-            })
 
 
 class Auth(object):
@@ -318,6 +287,14 @@ class Auth(object):
 
         logger.debug(u'completed authentication')
         if not ret[u'success']:
+            if type(auth_instance) is AuthByKeyPair:
+                logger.debug(
+                    "JWT Token authentication failed. "
+                    "Token expires at: %s. "
+                    "Current Time: %s",
+                    str(auth_instance._jwt_token_exp),
+                    str(datetime.utcnow())
+                )
             Error.errorhandler_wrapper(
                 self._rest._connection, None, DatabaseError,
                 {
@@ -357,58 +334,13 @@ class Auth(object):
                 self._rest._connection._session_id = ret[u'data'][u'sessionId']
             if u'sessionInfo' in ret[u'data']:
                 session_info = ret[u'data'][u'sessionInfo']
-                self._validate_default_database(session_info)
-                self._validate_default_schema(session_info)
-                self._validate_default_role(session_info)
-                self._validate_default_warehouse(session_info)
-
+                self._rest._connection._database = session_info.get(u'databaseName')
+                self._rest._connection._schema = session_info.get(u'schemaName')
+                self._rest._connection._warehouse = session_info.get(u'warehouseName')
+                self._rest._connection._role = session_info.get(u'roleName')
             self._rest._connection._set_parameters(ret, session_parameters)
 
         return session_parameters
-
-    def _validate_default_database(self, session_info):
-        default_value = self._rest._connection.database
-        session_info_value = session_info.get(u'databaseName')
-        self._rest._connection._database = session_info_value
-        self._validate_default_parameter(
-            'database', default_value, session_info_value)
-
-    def _validate_default_schema(self, session_info):
-        default_value = self._rest._connection.schema
-        session_info_value = session_info.get(u'schemaName')
-        self._rest._connection._schema = session_info_value
-        self._validate_default_parameter(
-            'schema', default_value, session_info_value)
-
-    def _validate_default_role(self, session_info):
-        default_value = self._rest._connection.role
-        session_info_value = session_info.get(u'roleName')
-        self._rest._connection._role = session_info_value
-        self._validate_default_parameter(
-            'role', default_value, session_info_value)
-
-    def _validate_default_warehouse(self, session_info):
-        default_value = self._rest._connection.warehouse
-        session_info_value = session_info.get(u'warehouseName')
-        self._rest._connection._warehouse = session_info_value
-        self._validate_default_parameter(
-            'warehouse', default_value, session_info_value)
-
-    def _validate_default_parameter(
-            self, name, default_value, session_info_value):
-        if self._rest._connection.validate_default_parameters and \
-                default_value is not None and \
-                session_info_value is None:
-            # validate default parameter
-            Error.errorhandler_wrapper(
-                self._rest._connection, None, DatabaseError,
-                {
-                    u'msg': u'Invalid {0} name: {1}'.format(
-                        name, default_value),
-                    u'errno': ER_INVALID_VALUE,
-                    u'sqlstate': SQLSTATE_CONNECTION_WAS_NOT_ESTABLISHED,
-
-                })
 
     def read_temporary_credential(self, account, user, session_parameters):
         if session_parameters.get(PARAMETER_CLIENT_STORE_TEMPORARY_CREDENTIAL):

@@ -9,9 +9,9 @@ import gzip
 import itertools
 import json
 import logging
-import platform
 import sys
 import time
+import traceback
 import uuid
 from io import BytesIO
 from threading import Lock
@@ -29,16 +29,25 @@ from snowflake.connector.time_util import get_time_millis
 from . import ssl_wrap_socket
 from .compat import (
     PY2,
-    ITERATOR,
     METHOD_NOT_ALLOWED, BAD_REQUEST, SERVICE_UNAVAILABLE, GATEWAY_TIMEOUT,
     FORBIDDEN, BAD_GATEWAY, REQUEST_TIMEOUT,
     UNAUTHORIZED, INTERNAL_SERVER_ERROR, OK, BadStatusLine)
-from .compat import (TO_UNICODE, urlencode, urlparse)
+from .compat import (TO_UNICODE, urlencode, urlparse, IncompleteRead)
 from .constants import (
     HTTP_HEADER_CONTENT_TYPE,
     HTTP_HEADER_ACCEPT,
     HTTP_HEADER_USER_AGENT,
-    HTTP_HEADER_SERVICE_NAME,
+    HTTP_HEADER_SERVICE_NAME
+)
+from .description import (
+    SNOWFLAKE_CONNECTOR_VERSION,
+    PYTHON_VERSION,
+    OPERATING_SYSTEM,
+    PLATFORM,
+    IMPLEMENTATION,
+    COMPILER,
+    CLIENT_NAME,
+    CLIENT_VERSION
 )
 from .errorcode import (ER_FAILED_TO_CONNECT_TO_DB, ER_CONNECTION_IS_CLOSED,
                         ER_FAILED_TO_REQUEST, ER_FAILED_TO_RENEW_SESSION)
@@ -49,13 +58,14 @@ from .errors import (Error, OperationalError, DatabaseError, ProgrammingError,
                      OtherHTTPRetryableError)
 from .sqlstate import (SQLSTATE_CONNECTION_NOT_EXISTS,
                        SQLSTATE_CONNECTION_WAS_NOT_ESTABLISHED,
-                       SQLSTATE_CONNECTION_REJECTED)
+                       SQLSTATE_CONNECTION_REJECTED,
+                       SQLSTATE_IO_ERROR)
+from .telemetry_oob import TelemetryService
 from .time_util import (
     DecorrelateJitterBackoff,
     DEFAULT_MASTER_VALIDITY_IN_SECONDS
 )
 from .tool.probe_connection import probe_connection
-from .version import VERSION
 
 if PY2:
     from pyasn1.error import PyAsn1Error
@@ -101,19 +111,20 @@ REQUEST_ID = u'requestId'
 REQUEST_GUID = u'request_guid'
 SNOWFLAKE_HOST_SUFFIX = u'.snowflakecomputing.com'
 
-SNOWFLAKE_CONNECTOR_VERSION = u'.'.join(TO_UNICODE(v) for v in VERSION[0:3])
-PYTHON_VERSION = u'.'.join(TO_UNICODE(v) for v in sys.version_info[:3])
-OPERATING_SYSTEM = platform.system()
-PLATFORM = platform.platform()
-IMPLEMENTATION = platform.python_implementation()
-COMPILER = platform.python_compiler()
+SNOWFLAKE_CONNECTOR_VERSION = SNOWFLAKE_CONNECTOR_VERSION
+PYTHON_VERSION = PYTHON_VERSION
+OPERATING_SYSTEM = OPERATING_SYSTEM
+PLATFORM = PLATFORM
+IMPLEMENTATION = IMPLEMENTATION
+COMPILER = COMPILER
 
-CLIENT_NAME = u"PythonConnector"  # don't change!
-CLIENT_VERSION = u'.'.join([TO_UNICODE(v) for v in VERSION[:3]])
+CLIENT_NAME = CLIENT_NAME  # don't change!
+CLIENT_VERSION = CLIENT_VERSION
 PYTHON_CONNECTOR_USER_AGENT = \
-    u'{name}/{version}/{python_version}/{platform}'.format(
+    u'{name}/{version}/{python_implementation}/{python_version}/{platform}'.format(
         name=CLIENT_NAME,
         version=SNOWFLAKE_CONNECTOR_VERSION,
+        python_implementation=IMPLEMENTATION,
         python_version=PYTHON_VERSION,
         platform=PLATFORM)
 
@@ -181,24 +192,6 @@ class SnowflakeAuth(AuthBase):
                 HEADER_AUTHORIZATION_KEY] = HEADER_SNOWFLAKE_TOKEN.format(
                 token=self.token)
         return r
-
-
-class ResultIterWithTimings(ITERATOR):
-    DOWNLOAD = u"download"
-    PARSE = u"parse"
-
-    def __init__(self, it, timings):
-        self._it = it
-        self._timings = timings
-
-    def __next__(self):
-        return next(self._it)
-
-    def next(self):
-        return self.__next__()
-
-    def get_timings(self):
-        return self._timings
 
 
 class SnowflakeRestful(object):
@@ -572,6 +565,7 @@ class SnowflakeRestful(object):
 
         class RetryCtx(object):
             def __init__(self, timeout, _include_retry_params=False):
+                self.total_timeout = timeout
                 self.timeout = timeout
                 self.cnt = 0
                 self.sleeping_time = 1
@@ -650,6 +644,19 @@ class SnowflakeRestful(object):
                 method, full_url, headers, data, conn)
             return {}
         except RetryRequest as e:
+            if retry_ctx.cnt == TelemetryService.get_instance().num_of_retry_to_trigger_telemetry:
+                _, _, stack_trace = sys.exc_info()
+                TelemetryService.get_instance().log_http_request(
+                    "HttpRequestRetry%dTimes" % retry_ctx.cnt,
+                    full_url,
+                    method,
+                    SQLSTATE_IO_ERROR,
+                    ER_FAILED_TO_REQUEST,
+                    retry_timeout=retry_ctx.total_timeout,
+                    retry_count=retry_ctx.cnt,
+                    exception=str(e),
+                    stack_trace=traceback.format_exc()
+                )
             if no_retry:
                 return {}
             cause = e.args[0]
@@ -657,6 +664,18 @@ class SnowflakeRestful(object):
                 retry_ctx.timeout -= int(time.time() - start_request_thread)
                 if retry_ctx.timeout <= 0:
                     logger.error(cause, exc_info=True)
+                    _, _, stack_trace = sys.exc_info()
+                    TelemetryService.get_instance().log_http_request(
+                        "HttpRequestRetryTimeout",
+                        full_url,
+                        method,
+                        SQLSTATE_IO_ERROR,
+                        ER_FAILED_TO_REQUEST,
+                        retry_timeout=retry_ctx.total_timeout,
+                        retry_count=retry_ctx.cnt,
+                        exception=str(e),
+                        stack_trace=traceback.format_exc()
+                    )
                     if isinstance(cause, Error):
                         Error.errorhandler_wrapper(conn, None, cause)
                     else:
@@ -738,8 +757,7 @@ class SnowflakeRestful(object):
             is_raw_text=False,
             is_raw_binary=False,
             binary_data_handler=None,
-            socket_timeout=DEFAULT_SOCKET_CONNECT_TIMEOUT,
-            return_timing_metrics=False):
+            socket_timeout=DEFAULT_SOCKET_CONNECT_TIMEOUT):
         if socket_timeout > DEFAULT_SOCKET_CONNECT_TIMEOUT:
             # socket timeout should not be more than the default.
             # A shorter timeout may be specified for login time, but
@@ -757,8 +775,7 @@ class SnowflakeRestful(object):
             else:
                 input_data = data
 
-            timing_metrics = {}
-            start_time = get_time_millis()
+            download_start_time = get_time_millis()
             # socket timeout is constant. You should be able to receive
             # the response within the time. If not, ConnectReadTimeout or
             # ReadTimeout is raised.
@@ -772,8 +789,7 @@ class SnowflakeRestful(object):
                 stream=is_raw_binary,
                 auth=SnowflakeAuth(token),
             )
-            timing_metrics[
-                ResultIterWithTimings.DOWNLOAD] = get_time_millis() - start_time
+            download_end_time = get_time_millis()
 
             try:
                 if raw_ret.status_code == OK:
@@ -781,15 +797,8 @@ class SnowflakeRestful(object):
                     if is_raw_text:
                         ret = raw_ret.text
                     elif is_raw_binary:
-                        start_time = get_time_millis()
-                        ret = binary_data_handler.to_iterator(raw_ret.raw)
-                        timing_metrics[
-                            ResultIterWithTimings.PARSE] = get_time_millis() - start_time
-
-                        # if timings requested, wrap the iterator so the timing
-                        # info is accessible
-                        if return_timing_metrics:
-                            ret = ResultIterWithTimings(ret, timing_metrics)
+                        ret = binary_data_handler.to_iterator(raw_ret.raw,
+                                                              download_end_time - download_start_time)
                     else:
                         ret = raw_ret.json()
                     return ret
@@ -818,6 +827,14 @@ class SnowflakeRestful(object):
                     )
                     return None  # required for tests
                 else:
+                    TelemetryService.get_instance().log_http_request(
+                        "HttpError%s" % str(raw_ret.status_code),
+                        full_url,
+                        method,
+                        SQLSTATE_CONNECTION_WAS_NOT_ESTABLISHED,
+                        ER_FAILED_TO_REQUEST,
+                        response=raw_ret
+                    )
                     Error.errorhandler_wrapper(
                         self._connection, None, InterfaceError,
                         {
@@ -838,6 +855,7 @@ class SnowflakeRestful(object):
                 ReadTimeout,
                 BadStatusLine,
                 ConnectionError,
+                IncompleteRead,
                 SSLError,
                 ProtocolError,  # from urllib3
                 ReadTimeoutError,  # from urllib3
@@ -859,6 +877,16 @@ class SnowflakeRestful(object):
                     "Ignore the following error stack: %s", err,
                     exc_info=True)
                 raise RetryRequest(err)
+            _, _, stack_trace = sys.exc_info()
+            TelemetryService.get_instance().log_http_request(
+                "HttpException%s" % str(err),
+                full_url,
+                method,
+                SQLSTATE_CONNECTION_WAS_NOT_ESTABLISHED,
+                ER_FAILED_TO_REQUEST,
+                exception=err,
+                stack_trace=traceback.format_exc()
+            )
             raise err
 
     def make_requests_session(self):

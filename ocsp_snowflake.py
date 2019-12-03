@@ -136,7 +136,6 @@ class SSDPubKey(object):
 
 
 class OCSPServer(object):
-
     MAX_RETRY = int(os.getenv('OCSP_MAX_RETRY', '3'))
 
     def __init__(self):
@@ -258,7 +257,7 @@ class OCSPServer(object):
             # OCSP response cache server.
             try:
                 retval = OCSPServer._download_ocsp_response_cache(ocsp,
-                                                         self.CACHE_SERVER_URL)
+                                                                  self.CACHE_SERVER_URL)
                 if not retval:
                     raise RevocationCheckError(msg="OCSP Cache Server Unavailable.")
                 logger.debug("downloaded OCSP response cache file from %s",
@@ -344,6 +343,9 @@ class OCSPServer(object):
 
 
 class OCSPCache(object):
+    # Activate server side directive support
+    ACTIVATE_SSD = False
+
     CACHE = {}
 
     # OCSP cache lock
@@ -352,9 +354,9 @@ class OCSPCache(object):
     # OCSP cache update flag
     CACHE_UPDATED = False
 
-    # Cache Expiration in seconds (24 hours). OCSP validation cache is
-    # invalidated every 24 hours
-    CACHE_EXPIRATION = 86400
+    # Cache Expiration in seconds (120 hours). OCSP validation cache is
+    # invalidated every 120 hours (5 days)
+    CACHE_EXPIRATION = 432000
 
     # OCSP Response Cache URI
     OCSP_RESPONSE_CACHE_URI = None
@@ -363,29 +365,39 @@ class OCSPCache(object):
     OCSP_RESPONSE_CACHE_FILE_NAME = 'ocsp_response_cache.json'
 
     # Cache directory
-    CACHE_ROOT_DIR = os.getenv('SF_OCSP_RESPONSE_CACHE_DIR') or \
-                     expanduser("~") or tempfile.gettempdir()
     CACHE_DIR = None
 
-    # Activate server side directive support
-    ACTIVATE_SSD = False
+    @staticmethod
+    def reset_cache_dir():
+        # Cache directory
+        OCSPCache.CACHE_DIR = os.getenv('SF_OCSP_RESPONSE_CACHE_DIR')
+        if OCSPCache.CACHE_DIR is None:
+            cache_root_dir = expanduser("~") or tempfile.gettempdir()
+            if platform.system() == 'Windows':
+                OCSPCache.CACHE_DIR = path.join(cache_root_dir, 'AppData', 'Local', 'Snowflake',
+                                                'Caches')
+            elif platform.system() == 'Darwin':
+                OCSPCache.CACHE_DIR = path.join(cache_root_dir, 'Library', 'Caches', 'Snowflake')
+            else:
+                OCSPCache.CACHE_DIR = path.join(cache_root_dir, '.cache', 'snowflake')
+        logger.debug("cache directory: %s", OCSPCache.CACHE_DIR)
 
-    if platform.system() == 'Windows':
-        CACHE_DIR = path.join(CACHE_ROOT_DIR, 'AppData', 'Local', 'Snowflake',
-                              'Caches')
-    elif platform.system() == 'Darwin':
-        CACHE_DIR = path.join(CACHE_ROOT_DIR, 'Library', 'Caches', 'Snowflake')
-    else:
-        CACHE_DIR = path.join(CACHE_ROOT_DIR, '.cache', 'snowflake')
+        if not path.exists(OCSPCache.CACHE_DIR):
+            try:
+                os.makedirs(OCSPCache.CACHE_DIR, mode=0o700)
+            except Exception as ex:
+                logger.debug('cannot create a cache directory: [%s], err=[%s]',
+                             OCSPCache.CACHE_DIR, ex)
+                OCSPCache.CACHE_DIR = None
 
-    if not path.exists(CACHE_DIR):
-        try:
-            os.makedirs(CACHE_DIR, mode=0o700)
-        except Exception as ex:
-            logger.debug('cannot create a cache directory: [%s], err=[%s]',
-                         CACHE_DIR, ex)
-            CACHE_DIR = None
-    logger.debug("cache directory: %s", CACHE_DIR)
+    @staticmethod
+    def del_cache_file():
+        """
+        Delete the OCSP response cache file if exists
+        """
+        cache_file = path.join(OCSPCache.CACHE_DIR, OCSPCache.OCSP_RESPONSE_CACHE_FILE_NAME)
+        if path.exists(cache_file):
+            os.unlink(cache_file)
 
     @staticmethod
     def set_ssd_status(ssd_status):
@@ -732,6 +744,10 @@ class OCSPCache(object):
             return len(OCSPCache.CACHE)
 
 
+# Reset OCSP cache directory
+OCSPCache.reset_cache_dir()
+
+
 class SFSsd(object):
     # Support for Server Side Directives
     ACTIVATE_SSD = False
@@ -851,7 +867,8 @@ class SnowflakeOCSP(object):
         r'(.*\.snowflakecomputing\.com$'
         r'|(?:|.*\.)s3.*\.amazonaws\.com$'  # start with s3 or .s3 in the middle
         r'|.*\.okta\.com$'
-        r'|.*\.blob\.core\.windows\.net$)')
+        r'|.*\.blob\.core\.windows\.net$'
+        r'|.*\.blob\.core\.usgovcloudapi\.net$)')
 
     # Tolerable validity date range ratio. The OCSP response is valid up
     # to (next update timestap) + (next update timestamp -
@@ -897,7 +914,7 @@ class SnowflakeOCSP(object):
 
         self.test_mode = os.getenv("SF_OCSP_TEST_MODE", None)
 
-        if self.test_mode is 'true':
+        if self.test_mode == 'true':
             logger.debug("WARNING - DRIVER CONFIGURED IN TEST MODE")
 
         self._use_post_method = use_post_method
@@ -1033,9 +1050,9 @@ class SnowflakeOCSP(object):
 
     @staticmethod
     def print_fail_open_warning(ocsp_log):
-        static_warning = "WARNING!!! Using fail-open to connect. Driver is connecting to an "\
-                         "HTTPS endpoint without OCSP based Certificate Revocation checking "\
-                         "as it could not obtain a valid OCSP Response to use from the CA OCSP "\
+        static_warning = "WARNING!!! Using fail-open to connect. Driver is connecting to an " \
+                         "HTTPS endpoint without OCSP based Certificate Revocation checking " \
+                         "as it could not obtain a valid OCSP Response to use from the CA OCSP " \
                          "responder. Details:"
         ocsp_warning = "{0} \n {1}".format(static_warning, ocsp_log)
         logger.error(ocsp_warning)
@@ -1157,7 +1174,11 @@ class SnowflakeOCSP(object):
     def _validate_certificates_sequential(self, cert_data, telemetry_data,
                                           hostname=None, do_retry=True):
         results = []
-        self._check_ocsp_response_cache_server(cert_data)
+        try:
+            self._check_ocsp_response_cache_server(cert_data)
+        except Exception as ex:
+            logger.debug("Caught unknown exception - %s. Continue to validate by direct connection", str(ex))
+
         for issuer, subject in cert_data:
             r = self.validate_by_direct_connection(
                 issuer, subject, telemetry_data, hostname, do_retry=do_retry)
@@ -1193,14 +1214,13 @@ class SnowflakeOCSP(object):
                 return
 
             try:
-                ca_bundle = (environ.get('REQUESTS_CA_BUNDLE') or
-                             environ.get('CURL_CA_BUNDLE'))
+                ca_bundle = environ.get('REQUESTS_CA_BUNDLE') or environ.get('CURL_CA_BUNDLE')
                 if ca_bundle and path.exists(ca_bundle):
                     # if the user/application specifies cabundle.
                     self.read_cert_bundle(ca_bundle)
                 else:
                     import sys
-                    from botocore.vendored.requests import certs
+                    from requests import certs
                     if hasattr(certs, '__file__') and \
                             path.exists(certs.__file__) and \
                             path.exists(path.join(
@@ -1252,8 +1272,6 @@ class SnowflakeOCSP(object):
 
         tolerable_validity = SnowflakeOCSP._calculate_tolerable_validity(
             this_update, next_update)
-        logger.debug(u'Tolerable Validity range for OCSP response: +%s(s)',
-                     tolerable_validity)
         return this_update - SnowflakeOCSP.MAX_CLOCK_SKEW <= \
                current_time <= next_update + tolerable_validity
 

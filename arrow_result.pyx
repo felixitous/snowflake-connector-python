@@ -3,16 +3,17 @@
 #
 
 # cython: profile=False
+# cython: language_level=3
 
 from base64 import b64decode
+import io
 from logging import getLogger
 from .telemetry import TelemetryField
 from .time_util import get_time_millis
 try:
-    from pyarrow.ipc import open_stream
-    from pyarrow import concat_tables
-    from .arrow_iterator import PyArrowIterator, ROW_UNIT, TABLE_UNIT, EMPTY_UNIT
+    from .arrow_iterator import PyArrowIterator, EmptyPyArrowIterator, ROW_UNIT, TABLE_UNIT, EMPTY_UNIT
     from .arrow_context import ArrowConverterContext
+    from pyarrow import concat_tables
 except ImportError:
     pass
 
@@ -34,14 +35,17 @@ cdef class ArrowResult:
         object _chunk_downloader
         object _arrow_context
         str _iter_unit
+        object _use_dict_result
 
-    def __init__(self, raw_response, cursor):
+
+    def __init__(self, raw_response, cursor, use_dict_result=False, _chunk_downloader=None):
         self._reset()
         self._cursor = cursor
         self._connection = cursor.connection
-        self._chunk_info(raw_response)
+        self._use_dict_result = use_dict_result
+        self._chunk_info(raw_response, _chunk_downloader)
 
-    def _chunk_info(self, data):
+    def _chunk_info(self, data, _chunk_downloader=None):
         self.total_row_index = -1  # last fetched number of rows
 
         self._chunk_index = 0
@@ -51,11 +55,12 @@ cdef class ArrowResult:
 
         if rowset_b64:
             arrow_bytes = b64decode(rowset_b64)
-            arrow_reader = open_stream(arrow_bytes)
             self._arrow_context = ArrowConverterContext(self._connection._session_parameters)
-            self._current_chunk_row = PyArrowIterator(arrow_reader, self._arrow_context)
+            self._current_chunk_row = PyArrowIterator(self._cursor, io.BytesIO(arrow_bytes),
+                                                      self._arrow_context, self._use_dict_result)
         else:
-            self._current_chunk_row = iter(())
+            logger.debug("Data from first gs response is empty")
+            self._current_chunk_row = EmptyPyArrowIterator()
         self._iter_unit = EMPTY_UNIT
 
         if u'chunks' in data:
@@ -76,11 +81,12 @@ cdef class ArrowResult:
                         header_value)
 
             logger.debug(u'qrmk=%s', qrmk)
-            self._chunk_downloader = self._connection._chunk_downloader_class(
-                chunks, self._connection, self._cursor, qrmk, chunk_headers,
-                query_result_format='arrow',
-                prefetch_threads=self._connection.client_prefetch_threads,
-                use_ijson=False)
+            self._chunk_downloader = _chunk_downloader if _chunk_downloader \
+                else self._connection._chunk_downloader_class(
+                    chunks, self._connection, self._cursor, qrmk, chunk_headers,
+                    query_result_format='arrow',
+                    prefetch_threads=self._connection.client_prefetch_threads,
+                    use_ijson=False)
 
     def __iter__(self):
         return self
@@ -125,7 +131,7 @@ cdef class ArrowResult:
                             self._chunk_downloader._total_millis_parsing_chunks)
                     self._chunk_downloader = None
                     self._chunk_count = 0
-                    self._current_chunk_row = iter(())
+                    self._current_chunk_row = EmptyPyArrowIterator()
                     is_done = True
 
             if is_done:
@@ -147,7 +153,7 @@ cdef class ArrowResult:
     def _reset(self):
         self.total_row_index = -1  # last fetched number of rows
         self._current_chunk_row_count = 0
-        self._current_chunk_row = iter(())
+        self._current_chunk_row = EmptyPyArrowIterator()
         self._chunk_index = 0
 
         if hasattr(self, u'_chunk_count') and self._chunk_count > 0 and \
@@ -171,9 +177,16 @@ cdef class ArrowResult:
             raise RuntimeError
 
         try:
-            self._current_chunk_row.init(self._iter_unit) # AttributeError if it is iter(())
+            self._current_chunk_row.init(self._iter_unit)
+            logger.debug(u'Init table iterator successfully, current chunk index: %s, '
+                         u'chunk count: %s', self._chunk_index, self._chunk_count)
             while self._chunk_index <= self._chunk_count:
-                table = self._current_chunk_row.__next__()
+                stop_iteration_except = False
+                try:
+                    table = self._current_chunk_row.__next__()
+                except StopIteration:
+                    stop_iteration_except = True
+
                 if self._chunk_index < self._chunk_count: # multiple chunks
                     logger.debug(
                         u"chunk index: %s, chunk_count: %s",
@@ -182,7 +195,11 @@ cdef class ArrowResult:
                     self._current_chunk_row = next_chunk.result_data
                     self._current_chunk_row.init(self._iter_unit)
                 self._chunk_index += 1
-                yield table
+
+                if stop_iteration_except:
+                    continue
+                else:
+                    yield table
             else:
                 if self._chunk_count > 0 and \
                         self._chunk_downloader is not None:
@@ -195,10 +212,7 @@ cdef class ArrowResult:
                         self._chunk_downloader._total_millis_parsing_chunks)
                 self._chunk_downloader = None
                 self._chunk_count = 0
-                self._current_chunk_row = iter(())
-        except AttributeError:
-            # just for handling the case of empty result
-            return None
+                self._current_chunk_row = EmptyPyArrowIterator()
         finally:
             if self._cursor._first_chunk_time:
                 logger.info("fetching data into pandas dataframe done")
@@ -208,37 +222,30 @@ cdef class ArrowResult:
                     time_consume_last_result)
 
     def _fetch_arrow_all(self):
-        '''
+        """
             Fetch a single Arrow Table
-        '''
+        """
         tables = list(self._fetch_arrow_batches())
         if tables:
             return concat_tables(tables)
         else:
             return None
 
-    def _fetch_pandas_batches(self):
-        '''
+    def _fetch_pandas_batches(self, **kwargs):
+        u"""
             Fetch Pandas dataframes in batch, where 'batch' refers to Snowflake Chunk
-            Thus, the batch size (the number of rows in dataframe) may be different
-            TODO: take a look at pyarrow to_pandas() API, which provides some useful arguments
-            e.g. 1. use `use_threads=true` for acceleration
-                 2. use `strings_to_categorical` and `categories` to encoding categorical data,
-                    which is really different from `string` in data science.
-                    For example, some data may be marked as 0 and 1 as binary class in dataset,
-                    the user wishes to interpret as categorical data instead of integer.
-                 3. use `zero_copy_only` to capture the potential unnecessary memory copying
-            we'd better also provide these handy arguments to make data scientists happy :)
-        '''
+            Thus, the batch size (the number of rows in dataframe) is optimized by
+            Snowflake Python Connector
+        """
         for table in self._fetch_arrow_batches():
-            yield table.to_pandas()
+            yield table.to_pandas(**kwargs)
 
-    def _fetch_pandas_all(self):
-        '''
+    def _fetch_pandas_all(self, **kwargs):
+        """
             Fetch a single Pandas dataframe
-        '''
+        """
         table = self._fetch_arrow_all()
         if table:
-            return table.to_pandas()
+            return table.to_pandas(**kwargs)
         else:
             return None

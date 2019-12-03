@@ -3,6 +3,8 @@
 #
 # Copyright (c) 2012-2019 Snowflake Computing Inc. All right reserved.
 #
+import platform
+import sys
 
 from datetime import datetime, timezone
 
@@ -18,6 +20,11 @@ from asn1crypto.ocsp import CertId, OCSPRequest, TBSRequest, Requests, \
     Request, OCSPResponse, Version
 from asn1crypto.x509 import Certificate
 
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    from oscrypto import asymmetric
+
 from snowflake.connector.errorcode import (
     ER_INVALID_OCSP_RESPONSE,
     ER_INVALID_OCSP_RESPONSE_CODE)
@@ -26,6 +33,11 @@ from snowflake.connector.ocsp_snowflake import SnowflakeOCSP
 from collections import OrderedDict
 from snowflake.connector.ssd_internal_keys import ret_wildcard_hkey
 from os import getenv
+
+# force versioned dylibs onto oscrypto ssl on catalina
+if sys.platform == 'darwin' and platform.mac_ver()[0].startswith('10.15'):
+    from oscrypto import use_openssl
+    use_openssl(libcrypto_path='/usr/lib/libcrypto.35.dylib', libssl_path='/usr/lib/libssl.35.dylib')
 
 logger = getLogger(__name__)
 
@@ -181,13 +193,10 @@ class SnowflakeOCSPAsn1Crypto(SnowflakeOCSP):
 
         basic_ocsp_response = res.basic_ocsp_response
         if basic_ocsp_response['certs'].native:
-            logger.debug("Certificate is attached in Basic OCSP Response")
             ocsp_cert = basic_ocsp_response['certs'][0]
             logger.debug("Verifying the attached certificate is signed by "
-                         "the issuer")
-            logger.debug(
-                "Valid Not After: %s",
-                ocsp_cert['tbs_certificate']['validity']['not_after'].native)
+                         "the issuer. Valid Not After: %s",
+                         ocsp_cert['tbs_certificate']['validity']['not_after'].native)
 
             cur_time = datetime.now(timezone.utc)
 
@@ -316,7 +325,7 @@ class SnowflakeOCSPAsn1Crypto(SnowflakeOCSP):
             raise RevocationCheckError(msg=debug_msg, errno=op_er.errno)
 
     def verify_signature(self, signature_algorithm, signature, cert, data):
-        pubkey = cert.public_key.unwrap().dump()
+        pubkey = asymmetric.load_public_key(cert.public_key).unwrap().dump()
         rsakey = RSA.importKey(pubkey)
         signer = PKCS1_v1_5.new(rsakey)
         if signature_algorithm in SnowflakeOCSPAsn1Crypto.SIGNATURE_ALGORITHM_TO_DIGEST_CLASS:

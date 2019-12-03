@@ -15,15 +15,9 @@ from .errorcode import (ER_CHUNK_DOWNLOAD_FAILED)
 from .errors import (Error, OperationalError)
 from .time_util import get_time_millis
 import json
-from io import StringIO
+from io import BytesIO
 from gzip import GzipFile
-
-try:
-    from pyarrow.ipc import open_stream
-    from .arrow_iterator import PyArrowIterator
-    from .arrow_context import ArrowConverterContext
-except ImportError:
-    pass
+from .arrow_context import ArrowConverterContext
 
 DEFAULT_REQUEST_TIMEOUT = 3600
 
@@ -255,7 +249,7 @@ class SnowflakeChunkDownloader(object):
         handler = JsonBinaryHandler(is_raw_binary_iterator=True,
                                     use_ijson=self._use_ijson) \
             if self._query_result_format == 'json' else \
-            ArrowBinaryHandler(self._cursor.description, self._connection)
+            ArrowBinaryHandler(self._cursor, self._connection)
 
         return self._connection.rest.fetch(
             u'get', url, headers,
@@ -308,7 +302,7 @@ class JsonBinaryHandler(RawBinaryDataHandler):
         elif not self._use_ijson:
             ret = iter(json.loads(raw_data))
         else:
-            ret = split_rows_from_stream(StringIO(raw_data))
+            ret = split_rows_from_stream(BytesIO(raw_data.encode('utf-8')))
 
         parse_end_time = get_time_millis()
 
@@ -322,15 +316,15 @@ class JsonBinaryHandler(RawBinaryDataHandler):
 
 class ArrowBinaryHandler(RawBinaryDataHandler):
 
-    def __init__(self, meta, connection):
-        self._meta = meta
+    def __init__(self, cursor, connection):
+        self._cursor = cursor
         self._arrow_context = ArrowConverterContext(connection._session_parameters)
 
     """
     Handler to consume data as arrow stream
     """
     def to_iterator(self, raw_data_fd, download_time):
+        from .arrow_iterator import PyArrowIterator
         gzip_decoder = GzipFile(fileobj=raw_data_fd, mode='r')
-        reader = open_stream(gzip_decoder)
-        it = PyArrowIterator(reader, self._arrow_context)
+        it = PyArrowIterator(self._cursor, gzip_decoder, self._arrow_context, self._cursor._use_dict_result)
         return it

@@ -22,7 +22,7 @@ public:
   /**
    * Constructor
    */
-  CArrowChunkIterator(PyObject* context);
+  CArrowChunkIterator(PyObject* context, std::vector<std::shared_ptr<arrow::RecordBatch>> *);
 
   /**
    * Desctructor
@@ -30,17 +30,27 @@ public:
   ~CArrowChunkIterator() = default;
 
   /**
-   * Add Arrow RecordBach to current chunk
-   * @param rb recordbatch to be added
-   */
-  void addRecordBatch(PyObject* rb) override;
-
-  /**
    * @return a python tuple object which contains all data in current row
    */
-  PyObject* next() override;
+  std::shared_ptr<ReturnVal> next() override;
 
-  void reset() override;
+protected:
+  /**
+   * @return python object of tuple which is tuple of all row values
+   */
+  virtual void createRowPyObject();
+
+  /** pointer to the latest returned python tuple(row) result */
+  py::UniqueRef m_latestReturnedRow;
+
+  /** list of column converters*/
+  std::vector<std::shared_ptr<sf::IColumnConverter>> m_currentBatchConverters;
+
+  /** row index inside current record batch (start from 0) */
+  int m_rowIndexInBatch;
+
+  /** schema of current record batch */
+  std::shared_ptr<arrow::Schema> m_currentSchema;
 
 private:
   /** number of columns */
@@ -52,28 +62,32 @@ private:
   /** current index that iterator points to */
   int m_currentBatchIndex;
 
-  /** row index inside current record batch (start from 0) */
-  int m_rowIndexInBatch;
-
   /** total number of rows inside current record batch */
   int64_t m_rowCountInBatch;
 
-  /** pointer to the latest returned python tuple(row) result */
-  py::UniqueRef m_latestReturnedRow;
-
-  /** list of column converters*/
-  std::vector<std::shared_ptr<sf::IColumnConverter>> m_currentBatchConverters;
+  /** pointer to the current python exception object */
+  py::UniqueRef m_currentPyException;
 
   /** arrow format convert context for the current session */
   PyObject* m_context;
 
-  /**
-   * @return python object of tuple which is tuple of all row values
-   */
-  void currentRowAsTuple();
-
   void initColumnConverters();
 };
+
+class DictCArrowChunkIterator : public CArrowChunkIterator
+{
+public:
+  DictCArrowChunkIterator(PyObject* context, std::vector<std::shared_ptr<arrow::RecordBatch>> *);
+
+  ~DictCArrowChunkIterator() = default;
+
+private:
+
+  void createRowPyObject() override;
+
+};
+
+
 }
 
 #endif  // PC_ARROWCHUNKITERATOR_HPP

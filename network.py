@@ -17,12 +17,12 @@ from io import BytesIO
 from threading import Lock
 
 import OpenSSL.SSL
-from botocore.vendored import requests
-from botocore.vendored.requests.adapters import HTTPAdapter
-from botocore.vendored.requests.auth import AuthBase
-from botocore.vendored.requests.exceptions import (
+import requests
+from requests.adapters import HTTPAdapter
+from requests.auth import AuthBase
+from requests.exceptions import (
     ConnectionError, ConnectTimeout, ReadTimeout, SSLError)
-from botocore.vendored.requests.packages.urllib3.exceptions import (
+from requests.packages.urllib3.exceptions import (
     ProtocolError, ReadTimeoutError)
 
 from snowflake.connector.time_util import get_time_millis
@@ -121,7 +121,7 @@ COMPILER = COMPILER
 CLIENT_NAME = CLIENT_NAME  # don't change!
 CLIENT_VERSION = CLIENT_VERSION
 PYTHON_CONNECTOR_USER_AGENT = \
-    u'{name}/{version}/{python_implementation}/{python_version}/{platform}'.format(
+    u'{name}/{version} ({platform}) {python_implementation}/{python_version}'.format(
         name=CLIENT_NAME,
         version=SNOWFLAKE_CONNECTOR_VERSION,
         python_implementation=IMPLEMENTATION,
@@ -429,7 +429,7 @@ class SnowflakeRestful(object):
             logger.error("Failed to heartbeat. code: %s, url: %s",
                          ret.get(u'code'), url)
 
-    def delete_session(self):
+    def delete_session(self, retry=False):
         """
         Deletes the session
         """
@@ -452,19 +452,31 @@ class SnowflakeRestful(object):
             headers[HTTP_HEADER_SERVICE_NAME] = self._connection.service_name
 
         body = {}
-        try:
-            ret = self._post_request(
-                url, headers, json.dumps(body),
-                token=self.token, timeout=5, no_retry=True)
-            if not ret or ret.get(u'success'):
-                return
-            err = ret.get(u'message')
-            if err is not None and ret.get(u'data'):
-                err += ret[u'data'].get(u'errorMessage', '')
-                # no exception is raised
-            logger.debug('error in deleting session. ignoring...: %s', err)
-        except Exception as e:
-            logger.debug('error in deleting session. ignoring...: %s', e)
+        retry_limit = 3 if retry else 1
+        num_retries = 0
+        should_retry = True
+        while should_retry and (num_retries < retry_limit):
+            try:
+                should_retry = False
+                ret = self._post_request(
+                    url, headers, json.dumps(body),
+                    token=self.token, timeout=5, no_retry=True)
+                if not ret:
+                    if retry:
+                        should_retry = True
+                    else:
+                        return
+                elif ret.get(u'success'):
+                    return
+                err = ret.get(u'message')
+                if err is not None and ret.get(u'data'):
+                    err += ret[u'data'].get(u'errorMessage', '')
+                    # no exception is raised
+                logger.debug('error in deleting session. ignoring...: %s', err)
+            except Exception as e:
+                logger.debug('error in deleting session. ignoring...: %s', e)
+            finally:
+                num_retries += 1
 
     def _get_request(self, url, headers, token=None,
                      timeout=None,
@@ -646,7 +658,7 @@ class SnowflakeRestful(object):
         except RetryRequest as e:
             if retry_ctx.cnt == TelemetryService.get_instance().num_of_retry_to_trigger_telemetry:
                 _, _, stack_trace = sys.exc_info()
-                TelemetryService.get_instance().log_http_request(
+                TelemetryService.get_instance().log_http_request_error(
                     "HttpRequestRetry%dTimes" % retry_ctx.cnt,
                     full_url,
                     method,
@@ -665,7 +677,7 @@ class SnowflakeRestful(object):
                 if retry_ctx.timeout <= 0:
                     logger.error(cause, exc_info=True)
                     _, _, stack_trace = sys.exc_info()
-                    TelemetryService.get_instance().log_http_request(
+                    TelemetryService.get_instance().log_http_request_error(
                         "HttpRequestRetryTimeout",
                         full_url,
                         method,
@@ -827,7 +839,7 @@ class SnowflakeRestful(object):
                     )
                     return None  # required for tests
                 else:
-                    TelemetryService.get_instance().log_http_request(
+                    TelemetryService.get_instance().log_http_request_error(
                         "HttpError%s" % str(raw_ret.status_code),
                         full_url,
                         method,
@@ -851,12 +863,23 @@ class SnowflakeRestful(object):
                     return None  # required for tests
             finally:
                 raw_ret.close()  # ensure response is closed
+        except SSLError as se:
+            logger.debug("Hit non-retryable SSL error, %s", str(se))
+            TelemetryService.get_instance().log_http_request_error(
+                "CertificateException%s" % str(se),
+                full_url,
+                method,
+                SQLSTATE_CONNECTION_WAS_NOT_ESTABLISHED,
+                ER_FAILED_TO_REQUEST,
+                exception=se,
+                stack_trace=traceback.format_exc()
+            )
+
         except (ConnectTimeout,
                 ReadTimeout,
                 BadStatusLine,
                 ConnectionError,
                 IncompleteRead,
-                SSLError,
                 ProtocolError,  # from urllib3
                 ReadTimeoutError,  # from urllib3
                 OpenSSL.SSL.SysCallError,
@@ -878,7 +901,7 @@ class SnowflakeRestful(object):
                     exc_info=True)
                 raise RetryRequest(err)
             _, _, stack_trace = sys.exc_info()
-            TelemetryService.get_instance().log_http_request(
+            TelemetryService.get_instance().log_http_request_error(
                 "HttpException%s" % str(err),
                 full_url,
                 method,

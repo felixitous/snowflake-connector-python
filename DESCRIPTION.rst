@@ -9,7 +9,60 @@ Source code is also available at: https://github.com/snowflakedb/snowflake-conne
 Release Notes
 -------------------------------------------------------------------------------
 
-- v1.9.0(August 26,2019)
+- v2.1.0(December 2,2019)
+
+    - GA: ARROW format support, to be enabled in the next few weeks.
+    - Fix default `ssl_context` options
+    - Pin more dependencies for Python Connector
+    - Fix import of SnowflakeOCSPAsn1Crypto crashes Python on MacOS Catalina
+    - Update the release note that 1.9.0 was removed
+    - Support DictCursor for arrow result format
+    - Upgrade Python's arrow lib to 0.15.1
+
+- v2.0.4(November 13,2019)
+
+    - Increase OCSP Cache expiry time from 24 hours to 120 hours.
+    - Fix pyarrow cxx11 abi compatibility issue
+    - Use new query result format parameter in python tests
+
+- v2.0.3(November 1,2019)
+
+    - Fix for ,Pandas fetch API did not handle the case that first chunk is empty correctly.
+    - Updated with botocore, boto3 and requests packages to the latest version.
+    - Pinned stable versions of Azure urllib3 packages.
+
+- v2.0.2(October 21,2019)
+
+    - Fix sessions remaining open even if they are disposed manually. Retry deleting session if the connection is explicitly closed.
+    - Fix memory leak in the new fetch pandas API
+    - Fix Auditwheel failed with python37
+    - Reduce the footprint of Python Connector
+    - Support asn1crypto 1.1.x
+    - Ensure that the cython components are present for Conda package
+
+- v2.0.1(October 04,2019)
+
+    - Add asn1crypto requirement to mitigate incompatibility change
+
+- v2.0.0(September 30,2019)
+
+    - Release Python Connector 2.0.0 for Arrow format change.
+    - Fix SF_OCSP_RESPONSE_CACHE_DIR referring to the OCSP cache response file directory and not the top level of directory.
+    - Fix Malformed certificate ID key causes uncaught KeyError.
+    - No retry for certificate errors.
+    - Fix In-Memory OCSP Response Cache - PythonConnector
+    - Move AWS_ID and AWS_SECRET_KEY to their newer versions in the Python client
+    - Fix result set downloader for ijson 2.5
+    - Make authenticator field case insensitive earlier
+    - Update USER-AGENT to be consistent with new format
+    - Update Python Driver URL Whitelist to support US Gov domain
+    - Fix memory leak in python connector panda df fetch API
+
+- v1.9.1(October 4,2019)
+   
+    - Add asn1crypto requirement to mitigate incompatibility change.
+
+- v1.9.0(August 26,2019) **REMOVED from pypi due to dependency compatibility issues**
 
     - Implement converter for all arrow data types in python connector extension
     - Fix arrow error when returning empty result using python connecter

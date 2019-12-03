@@ -11,6 +11,10 @@
 """
 OCSP Mode: FAIL_OPEN, FAIL_CLOSED or INSECURE
 """
+import certifi
+from six import wraps
+from urllib3.contrib.pyopenssl import PyOpenSSLContext
+
 from .constants import OCSPMode
 
 FEATURE_OCSP_MODE = OCSPMode.FAIL_OPEN
@@ -28,15 +32,16 @@ from socket import error as SocketError
 from socket import (socket, timeout)
 
 import OpenSSL.SSL
-from botocore.vendored.requests.packages.urllib3 import connection \
-    as urllib3_connection
-from botocore.vendored.requests.packages.urllib3 import util \
-    as urllib3_util
+
 from cryptography import x509
 from cryptography.hazmat.backends.openssl import backend as openssl_backend
 from cryptography.hazmat.backends.openssl.x509 import _Certificate
 
+import requests.packages.urllib3.util.ssl_ as ssl_
+import requests.packages.urllib3.connection as connection_
+
 from .compat import PY2
+from .compat import get_args
 from .errorcode import (ER_SERVER_CERTIFICATE_REVOKED)
 from .errors import (OperationalError)
 from .ssl_wrap_util import wait_for_read, wait_for_write
@@ -84,7 +89,7 @@ def inject_into_urllib3():
     Monkey-patch urllib3 with PyOpenSSL-backed SSL-support and OCSP.
     """
     log.debug(u'Injecting ssl_wrap_socket_with_ocsp')
-    urllib3_connection.ssl_wrap_socket = ssl_wrap_socket_with_ocsp
+    connection_.ssl_wrap_socket = ssl_wrap_socket_with_ocsp
 
 
 def _dnsname_to_stdlib(name):
@@ -310,7 +315,7 @@ else:  # Platform-specific: Python 3
 
 WrappedSocket.makefile = makefile
 
-DEFAULT_SSL_CIPHER_LIST = urllib3_util.ssl_.DEFAULT_CIPHERS
+DEFAULT_SSL_CIPHER_LIST = ssl_.DEFAULT_CIPHERS
 if isinstance(DEFAULT_SSL_CIPHER_LIST, str):
     DEFAULT_SSL_CIPHER_LIST = DEFAULT_SSL_CIPHER_LIST.encode('utf-8')
 
@@ -367,13 +372,31 @@ def _verify_callback(cnx, x509, err_no, err_depth, return_code):
     return err_no == 0
 
 
-def ssl_wrap_socket_with_ocsp(
-        sock, keyfile=None, certfile=None, cert_reqs=None,
-        ca_certs=None, server_hostname=None, ssl_version=None):
-    ret = ssl_wrap_socket(
-        sock, keyfile=keyfile, certfile=certfile, cert_reqs=cert_reqs,
-        ca_certs=ca_certs, server_hostname=server_hostname,
-        ssl_version=ssl_version)
+@wraps(ssl_.ssl_wrap_socket)
+def ssl_wrap_socket_with_ocsp(*args, **kwargs):
+    # Extract host_name
+    hostname_index = get_args(ssl_.ssl_wrap_socket).args.index('server_hostname')
+    server_hostname = args[hostname_index] if len(args) > hostname_index else kwargs.get('server_hostname', None)
+    # Remove context if present
+    ssl_context_index = get_args(ssl_.ssl_wrap_socket).args.index('ssl_context')
+    context_in_args = len(args) > ssl_context_index
+    ssl_context = args[hostname_index] if context_in_args else kwargs.get('ssl_context', None)
+    if not isinstance(ssl_context, PyOpenSSLContext):
+        # Create new default context
+        if context_in_args:
+            new_args = list(args)
+            new_args[ssl_context_index] = None
+            args = tuple(new_args)
+        else:
+            del kwargs['ssl_context']
+    # Fix ca certs location
+    ca_certs_index = get_args(ssl_.ssl_wrap_socket).args.index('ca_certs')
+    ca_certs_in_args = len(args) > ca_certs_index
+    if not ca_certs_in_args and not kwargs.get('ca_certs'):
+        kwargs['ca_certs'] = certifi.where()
+
+    ret = ssl_.ssl_wrap_socket(*args, **kwargs)
+
     global FEATURE_OCSP_MODE
     global FEATURE_OCSP_RESPONSE_CACHE_FILE_NAME
 

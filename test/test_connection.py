@@ -415,20 +415,6 @@ def test_invalid_account_timeout():
 
 
 @pytest.mark.timeout(15)
-def test_invalid_port(db_parameters):
-    with pytest.raises(OperationalError):
-        snowflake.connector.connect(
-            protocol='http',
-            account='testaccount',
-            user=db_parameters['user'],
-            password=db_parameters['password'],
-            host=db_parameters['host'],
-            port=12345,
-            login_timeout=5,
-        )
-
-
-@pytest.mark.timeout(15)
 def test_invalid_proxy(db_parameters):
     with pytest.raises(OperationalError):
         snowflake.connector.connect(
@@ -635,3 +621,14 @@ class ExecPrivatelinkThread(threading.Thread):
             self.bucket.put("Fail")
         else:
             self.bucket.put("Success")
+
+
+def test_another_site(db_parameters):
+    import urllib3
+
+    def get(url):
+        pool_manager = urllib3.PoolManager()
+        res = pool_manager.request('GET', url)
+        return res.status
+
+    assert get('https://wikipedia.org') == 200

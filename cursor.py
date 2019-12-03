@@ -15,12 +15,16 @@ from six import u
 from .compat import (BASE_EXCEPTION_CLASS)
 from .constants import (
     FIELD_NAME_TO_ID,
+    PARAMETER_PYTHON_CONNECTOR_QUERY_RESULT_FORMAT
 )
 from .errorcode import (ER_UNSUPPORTED_METHOD,
                         ER_CURSOR_IS_CLOSED,
                         ER_FAILED_TO_REWRITE_MULTI_ROW_INSERT,
                         ER_NOT_POSITIVE_SIZE,
-                        ER_INVALID_VALUE)
+                        ER_INVALID_VALUE,
+                        ER_NO_PYARROW,
+                        ER_NO_ARROW_RESULT,
+                        ER_NO_PYARROW_SNOWSQL)
 from .errors import (Error, ProgrammingError, NotSupportedError,
                      DatabaseError, InterfaceError)
 from .file_transfer_agent import (SnowflakeFileTransferAgent)
@@ -29,10 +33,20 @@ from .sqlstate import (SQLSTATE_FEATURE_NOT_SUPPORTED)
 from .telemetry import (TelemetryData, TelemetryField)
 from .time_util import get_time_millis
 
+logger = getLogger(__name__)
+
+try:
+    import pyarrow
+except ImportError:
+    logger.debug("Failed to import pyarrow. No Apache Arrow result set format can be used.")
+    pyarrow = None
+
 try:
     from .arrow_result import ArrowResult
+    CAN_USE_ARROW_RESULT = True
 except ImportError:
-    pass
+    logger.debug("Failed to import ArrowResult. No Apache Arrow result set format can be used.")
+    CAN_USE_ARROW_RESULT = False
 
 STATEMENT_TYPE_ID_DML = 0x3000
 STATEMENT_TYPE_ID_INSERT = STATEMENT_TYPE_ID_DML + 0x100
@@ -49,8 +63,6 @@ STATEMENT_TYPE_ID_DML_SET = frozenset(
 
 DESC_TABLE_RE = re.compile(u(r'desc(?:ribe)?\s+([\w_]+)\s*;?\s*$'),
                            flags=re.IGNORECASE)
-
-logger = getLogger(__name__)
 
 LOG_MAX_QUERY_LENGTH = 80
 
@@ -70,7 +82,14 @@ class SnowflakeCursor(object):
         u(r'alter\s+session\s+set\s+(.*)=\'?([^\']+)\'?\s*;'),
         flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
 
-    def __init__(self, connection, json_result_class=JsonResult):
+    def __init__(self, connection, use_dict_result=False, json_result_class=JsonResult):
+        """
+        :param connection: connection created this cursor
+        :param use_dict_result: whether use dict result or not. This variable only applied to
+                                arrow result. When result in json, json_result_class will be
+                                honored
+        :param json_result_class: class that used in json result
+        """
         self._connection = connection
 
         self._errorhandler = Error.default_errorhandler
@@ -94,6 +113,7 @@ class SnowflakeCursor(object):
         self._timezone = None
         self._binary_output_format = None
         self._result = None
+        self._use_dict_result = use_dict_result
         self._json_result_class = json_result_class
 
         self._arraysize = 1  # PEP-0249: defaults to 1
@@ -110,7 +130,6 @@ class SnowflakeCursor(object):
         try:
             self.close()
         except BASE_EXCEPTION_CLASS as e:
-            logger = getLogger(__name__)
             if logger.getEffectiveLevel() <= logging.INFO:
                 logger.info(e)
 
@@ -305,6 +324,18 @@ class SnowflakeCursor(object):
                     u'errno': ER_INVALID_VALUE,
                 })
 
+        # check if current installation include arrow extension or not,
+        # if not, we set statement level query result format to be JSON
+        if not CAN_USE_ARROW_RESULT:
+            if statement_params is None:
+                statement_params = {PARAMETER_PYTHON_CONNECTOR_QUERY_RESULT_FORMAT: 'JSON'}
+            else:
+                result_format_val = statement_params.get(PARAMETER_PYTHON_CONNECTOR_QUERY_RESULT_FORMAT)
+                if str(result_format_val).upper() == u'ARROW':
+                    self.check_can_use_arrow_resultset()
+                elif result_format_val is None:
+                    statement_params[PARAMETER_PYTHON_CONNECTOR_QUERY_RESULT_FORMAT] = 'JSON'
+
         self._sequence_counter = self._connection._next_sequence_counter()
         self._request_id = uuid.uuid4()
 
@@ -425,7 +456,7 @@ class SnowflakeCursor(object):
                 _no_results=False,
                 _use_ijson=False,
                 _is_put_get=None,
-                _raise_put_get_error=False,
+                _raise_put_get_error=True,
                 _force_put_overwrite=False):
         u"""
         Executes a command/query
@@ -466,11 +497,7 @@ class SnowflakeCursor(object):
                 processed_params = self._connection._process_params_qmarks(
                     params, self)
         # Skip reporting Key, Value and Type errors
-        except KeyError:
-            raise
-        except ValueError:
-            raise
-        except TypeError:
+        except (KeyError, ValueError, TypeError):
             raise
         except Exception:
             self.connection.incident.report_incident()
@@ -598,8 +625,11 @@ class SnowflakeCursor(object):
                                       column[u'scale'],
                                       column[u'nullable']))
 
-        self._result = ArrowResult(data, self) if self._query_result_format == 'arrow' \
-            else self._json_result_class(data, self, use_ijson)
+        if self._query_result_format == 'arrow':
+            self.check_can_use_arrow_resultset()
+            self._result = ArrowResult(data, self, use_dict_result=self._use_dict_result)
+        else:
+            self._result = self._json_result_class(data, self, use_ijson)
 
         if is_dml:
             updated_rows = 0
@@ -614,6 +644,48 @@ class SnowflakeCursor(object):
                 self._total_rowcount = updated_rows
             else:
                 self._total_rowcount += updated_rows
+
+    def check_can_use_arrow_resultset(self):
+        global CAN_USE_ARROW_RESULT
+
+        if not CAN_USE_ARROW_RESULT:
+            if self._connection.application == 'SnowSQL':
+                msg = (
+                    "Currently SnowSQL doesn't support the result set in Apache Arrow format."
+                )
+                errno = ER_NO_PYARROW_SNOWSQL
+            else:
+                msg = (
+                    "The result set in Apache Arrow format is not supported for the platform."
+                )
+                errno = ER_NO_ARROW_RESULT
+
+            Error.errorhandler_wrapper(
+                self.connection, self,
+                ProgrammingError,
+                {
+                    u'msg': msg,
+                    u'errno': errno,
+                }
+            )
+
+    def check_can_use_pandas(self):
+        global pyarrow
+
+        if pyarrow is None:
+            msg = (
+                "pyarrow package is missing. Install using pip if the platform is supported."
+            )
+            errno = ER_NO_PYARROW
+
+            Error.errorhandler_wrapper(
+                self.connection, self,
+                ProgrammingError,
+                {
+                    u'msg': msg,
+                    u'errno': errno,
+                }
+            )
 
     def query_result(self, qid, _use_ijson=False):
         url = '/queries/{qid}/result'.format(qid=qid)
@@ -647,22 +719,26 @@ class SnowflakeCursor(object):
                                        errvalue)
         return self
 
-    def fetch_pandas_batches(self):
+    def fetch_pandas_batches(self, **kwargs):
         u"""
         Fetch a single Arrow Table
+        @param kwargs: will be passed to pyarrow.Table.to_pandas() method
         """
-        if self._query_result_format != 'arrow':
+        self.check_can_use_pandas()
+        if self._query_result_format != 'arrow':  # TODO: or pandas isn't imported
             raise NotSupportedError
-        for df in self._result._fetch_pandas_batches():
+        for df in self._result._fetch_pandas_batches(**kwargs):
             yield df
 
-    def fetch_pandas_all(self):
+    def fetch_pandas_all(self, **kwargs):
         u"""
         Fetch Pandas dataframes in batch, where 'batch' refers to Snowflake Chunk
+        @param kwargs: will be passed to pyarrow.Table.to_pandas() method
         """
+        self.check_can_use_pandas()
         if self._query_result_format != 'arrow':
             raise NotSupportedError
-        return self._result._fetch_pandas_all()
+        return self._result._fetch_pandas_all(**kwargs)
 
     def abort_query(self, qid):
         url = '/queries/{qid}/abort-request'.format(qid=qid)
@@ -872,4 +948,4 @@ class DictCursor(SnowflakeCursor):
     """
 
     def __init__(self, connection):
-        SnowflakeCursor.__init__(self, connection, DictJsonResult)
+        SnowflakeCursor.__init__(self, connection, use_dict_result=True, json_result_class=DictJsonResult)

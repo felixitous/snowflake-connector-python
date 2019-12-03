@@ -158,8 +158,17 @@ def IS_OLD_PYTHON():
            not PY2 and sys.hexversion < 0x03040300
 
 
+try:
+    from inspect import getfullargspec as _get_args
+except ImportError:
+    from inspect import getargspec as _get_args
+
+
+get_args = _get_args
+
+
 """
-Is Python 3.4.3 or 3.5.0
+Is Python 3.5.0
 This is to check if a workaround for http://bugs.python.org/issue23517
 is required or not. 3.6.0 already has the fix.
 No RC or dev version will be checked.

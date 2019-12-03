@@ -14,45 +14,47 @@
 #include "TimeConverter.hpp"
 #include <string>
 
+#define SF_CHECK_PYTHON_ERR() \
+  if (py::checkPyError())\
+  {\
+    PyObject *type, * val, *traceback;\
+    PyErr_Fetch(&type, &val, &traceback);\
+    PyErr_Clear();\
+    m_currentPyException.reset(val);\
+\
+    Py_XDECREF(type);\
+    Py_XDECREF(traceback);\
+\
+    return std::make_shared<ReturnVal>(nullptr, m_currentPyException.get());\
+  }
+
+
 namespace sf
 {
 
-CArrowChunkIterator::CArrowChunkIterator(PyObject* context)
-: m_latestReturnedRow(nullptr), m_context(context)
+CArrowChunkIterator::CArrowChunkIterator(PyObject* context, std::vector<std::shared_ptr<arrow::RecordBatch>> *batches)
+: CArrowIterator(batches), m_latestReturnedRow(nullptr), m_context(context)
 {
-}
-
-void CArrowChunkIterator::addRecordBatch(PyObject* rb)
-{
-  // may add some specific behaviors for this iterator
-  CArrowIterator::addRecordBatch(rb);
-}
-
-void CArrowChunkIterator::reset()
-{
-  m_batchCount = m_cRecordBatches.size();
-  m_columnCount = m_batchCount > 0 ? m_cRecordBatches[0]->num_columns() : 0;
+  m_batchCount = m_cRecordBatches->size();
+  m_columnCount = m_batchCount > 0 ? (*m_cRecordBatches)[0]->num_columns() : 0;
   m_currentBatchIndex = -1;
   m_rowIndexInBatch = -1;
   m_rowCountInBatch = 0;
   m_latestReturnedRow.reset();
 
-  logger.info("Arrow chunk info: batchCount %d, columnCount %d", m_batchCount,
-              m_columnCount);
+  logger.debug("Arrow chunk info: batchCount %d, columnCount %d", m_batchCount,
+               m_columnCount);
 }
 
-PyObject* CArrowChunkIterator::next()
+std::shared_ptr<ReturnVal> CArrowChunkIterator::next()
 {
   m_rowIndexInBatch++;
 
   if (m_rowIndexInBatch < m_rowCountInBatch)
   {
-    this->currentRowAsTuple();
-    if (py::checkPyError())
-    {
-      return nullptr;
-    }
-    return m_latestReturnedRow.get();
+    this->createRowPyObject();
+    SF_CHECK_PYTHON_ERR()
+    return std::make_shared<ReturnVal>(m_latestReturnedRow.get(), nullptr);
   }
   else
   {
@@ -60,31 +62,26 @@ PyObject* CArrowChunkIterator::next()
     if (m_currentBatchIndex < m_batchCount)
     {
       m_rowIndexInBatch = 0;
-      m_rowCountInBatch = m_cRecordBatches[m_currentBatchIndex]->num_rows();
+      m_rowCountInBatch = (*m_cRecordBatches)[m_currentBatchIndex]->num_rows();
       this->initColumnConverters();
-      if (py::checkPyError())
-      {
-        return nullptr;
-      }
+      SF_CHECK_PYTHON_ERR()
 
-      logger.info("Current batch index: %d, rows in current batch: %d",
+      logger.debug("Current batch index: %d, rows in current batch: %d",
                   m_currentBatchIndex, m_rowCountInBatch);
 
-      this->currentRowAsTuple();
-      if (py::checkPyError())
-      {
-        return nullptr;
-      }
-      return m_latestReturnedRow.get();
+      this->createRowPyObject();
+      SF_CHECK_PYTHON_ERR()
+
+      return std::make_shared<ReturnVal>(m_latestReturnedRow.get(), nullptr);
     }
   }
 
   /** It looks like no one will decrease the ref of this Py_None, so we don't
    * increament the ref count here */
-  return Py_None;
+  return std::make_shared<ReturnVal>(Py_None, nullptr);
 }
 
-void CArrowChunkIterator::currentRowAsTuple()
+void CArrowChunkIterator::createRowPyObject()
 {
   m_latestReturnedRow.reset(PyTuple_New(m_columnCount));
   for (int i = 0; i < m_columnCount; i++)
@@ -100,14 +97,14 @@ void CArrowChunkIterator::initColumnConverters()
 {
   m_currentBatchConverters.clear();
   std::shared_ptr<arrow::RecordBatch> currentBatch =
-      m_cRecordBatches[m_currentBatchIndex];
-  std::shared_ptr<arrow::Schema> schema = currentBatch->schema();
+      (*m_cRecordBatches)[m_currentBatchIndex];
+  m_currentSchema = currentBatch->schema();
   for (int i = 0; i < currentBatch->num_columns(); i++)
   {
     std::shared_ptr<arrow::Array> columnArray = currentBatch->column(i);
-    std::shared_ptr<arrow::DataType> dt = schema->field(i)->type();
+    std::shared_ptr<arrow::DataType> dt = m_currentSchema->field(i)->type();
     std::shared_ptr<const arrow::KeyValueMetadata> metaData =
-        schema->field(i)->metadata();
+        m_currentSchema->field(i)->metadata();
     SnowflakeType::Type st = SnowflakeType::snowflakeTypeFromString(
         metaData->value(metaData->FindKey("logicalType")));
 
@@ -216,6 +213,7 @@ void CArrowChunkIterator::initColumnConverters()
       case SnowflakeType::Type::OBJECT:
       case SnowflakeType::Type::VARIANT:
       case SnowflakeType::Type::TEXT:
+      case SnowflakeType::Type::ARRAY:
       {
         m_currentBatchConverters.push_back(
             std::make_shared<sf::StringConverter>(columnArray));
@@ -406,14 +404,32 @@ void CArrowChunkIterator::initColumnConverters()
       default:
       {
         std::string errorInfo = Logger::formatString(
-            "[Snowflake Exception] unknown snowflake data type : %d",
-            metaData->value(metaData->FindKey("logicalType")));
+            "[Snowflake Exception] unknown snowflake data type : %s",
+            metaData->value(metaData->FindKey("logicalType")).c_str());
         logger.error(errorInfo.c_str());
         PyErr_SetString(PyExc_Exception, errorInfo.c_str());
         return;
       }
     }
   }
+}
+
+DictCArrowChunkIterator::DictCArrowChunkIterator(PyObject* context,
+                                                 std::vector<std::shared_ptr<arrow::RecordBatch>> * batches)
+: CArrowChunkIterator(context, batches)
+{
+}
+
+void DictCArrowChunkIterator::createRowPyObject()
+{
+  m_latestReturnedRow.reset(PyDict_New());
+  for (int i = 0; i < m_currentSchema->num_fields(); i++)
+  {
+    PyDict_SetItemString(
+        m_latestReturnedRow.get(), m_currentSchema->field(i)->name().c_str(),
+        m_currentBatchConverters[i]->toPyObject(m_rowIndexInBatch));
+  }
+  return;
 }
 
 }  // namespace sf

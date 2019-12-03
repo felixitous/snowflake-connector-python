@@ -42,6 +42,7 @@ if isBuildExtEnabled == 'true':
     from Cython.Build import cythonize
     import os
     import pyarrow
+    import numpy
 
     extensions = cythonize(
         [
@@ -77,9 +78,15 @@ if isBuildExtEnabled == 'true':
                                 'cpp/Logging/logging.cpp']
                 ext.include_dirs.append('cpp/ArrowIterator/')
                 ext.include_dirs.append('cpp/Logging')
-                ext.include_dirs.append(pyarrow.get_include())
 
-                ext.extra_compile_args.append('-std=c++11')
+                if platform == 'win32':
+                    ext.include_dirs.append(pyarrow.get_include())
+                    ext.include_dirs.append(numpy.get_include())
+                elif self._is_unix():
+                    ext.extra_compile_args.append('-isystem' + pyarrow.get_include())
+                    ext.extra_compile_args.append('-isystem' + numpy.get_include())
+                    ext.extra_compile_args.append('-std=c++11')
+                    ext.extra_compile_args.append('-D_GLIBCXX_USE_CXX11_ABI=0')
 
                 ext.library_dirs.append(os.path.join(current_dir, self.build_lib, 'snowflake', 'connector'))
                 ext.extra_link_args += self._get_arrow_lib_as_linker_input()
@@ -124,7 +131,7 @@ if isBuildExtEnabled == 'true':
 
         def _get_pyarrow_lib_pattern(self, lib_name):
             if platform.startswith('linux'):
-                return '{}/lib{}.so*'.format(self._get_arrow_lib_dir(), lib_name)
+                return '{}/lib{}.so.*'.format(self._get_arrow_lib_dir(), lib_name)
             elif platform == 'darwin':
                 return '{}/lib{}*dylib'.format(self._get_arrow_lib_dir(), lib_name)
             elif platform == 'win32':
@@ -155,21 +162,25 @@ setup(
     python_requires='>=2.7.9,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*',
 
     install_requires=[
-        'azure-common',
-        'azure-storage-blob',
-        'boto3>=1.4.4,<1.10.0',
-        'botocore>=1.5.0,<1.13.0',
-        'certifi',
-        'future',
-        'six',
-        'pytz',
-        'pycryptodomex>=3.2,!=3.5.0',
-        'pyOpenSSL>=16.2.0',
-        'cffi>=1.9',
-        'cryptography>=1.8.2',
-        'ijson',
-        'pyjwt',
-        'idna',
+        'azure-common<2.0.0',
+        'azure-storage-blob<12.0.0',
+        'boto3>=1.4.4,<1.11.0',
+        'botocore>=1.5.0,<1.14.0',
+        'requests<2.23.0',
+        'urllib3>=1.20,<1.26.0',
+        'certifi<2021.0.0',
+        'future<1.0.0',
+        'six<2.0.0',
+        'pytz<2021.0',
+        'pycryptodomex>=3.2,!=3.5.0,<4.0.0',
+        'pyOpenSSL>=16.2.0,<21.0.0',
+        'cffi>=1.9,<1.14',
+        'cryptography>=1.8.2,<3.0.0',
+        'ijson<3.0.0',
+        'pyjwt<2.0.0',
+        'idna<3.0.0',
+        'oscrypto<2.0.0',
+        'asn1crypto>0.24.0,<2.0.0',
         'pyasn1>=0.4.0,<0.5.0;python_version<"3.0"',
         'pyasn1-modules>=0.2.0,<0.3.0;python_version<"3.0"',
         'enum34;python_version<"3.4"',
@@ -204,10 +215,28 @@ setup(
         "secure-local-storage": [
             'keyring!=16.1.0'
         ],
-        "arrow-result": [
-            'pyarrow>=0.14.0;python_version>"3.4"',
-            'pyarrow>=0.14.0;python_version<"3.0"'
-        ]
+        "pandas": [
+            'pyarrow>=0.15.1,<0.16.0;python_version>"3.4"',
+            'pandas==0.24.2;python_version=="2.7" or python_version=="3.5"',
+            'pandas<1.0.0;python_version>"3.5"',
+        ],
+        "development": [
+            'pytest==4.6.6',  # Last Python 2.7 supported version
+            'pytest-cov',
+            'pytest-rerunfailures',
+            'pytest-timeout',
+            'coverage',
+            'pexpect',
+            'mock',
+            'pytz',
+            'pytzdata',
+            'Cython',
+            'pendulum',
+            'more-itertools==4.3.0;python_version=="2.7"',  # Last Python 2.7 supported version
+            'more-itertools;python_version!="2.7"',
+            'numpy==1.16.5;python_version=="2.7"',  # Last Python 2.7 supported version
+            'numpy;python_version!="2.7"',
+        ],
     },
 
     classifiers=[

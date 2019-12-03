@@ -11,8 +11,43 @@
 #include <arrow/python/pyarrow.h>
 #include "logging.hpp"
 
+#define SF_CHECK_ARROW_RC(arrow_status, format_string, ...) \
+  if (!arrow_status.ok()) \
+  { \
+    std::string errorInfo = Logger::formatString(format_string, ##__VA_ARGS__); \
+    logger.error(errorInfo.c_str()); \
+    PyErr_SetString(PyExc_Exception, errorInfo.c_str()); \
+    return; \
+  }
+
+#define SF_CHECK_ARROW_RC_AND_RETURN(arrow_status, ret_val, format_string, ...) \
+  if (!arrow_status.ok()) \
+  { \
+    std::string errorInfo = Logger::formatString(format_string, ##__VA_ARGS__); \
+    logger.error(errorInfo.c_str()); \
+    PyErr_SetString(PyExc_Exception, errorInfo.c_str()); \
+    return ret_val; \
+  }
+
 namespace sf
 {
+
+/**
+ * A simple struct to contain return data back cython.
+ * PyObject would be nullptr if failed and cause string will be populated
+ */
+class ReturnVal
+{
+public:
+  ReturnVal(PyObject * obj, PyObject *except) :
+    successObj(obj), exception(except)
+  {
+  }
+
+  PyObject * successObj;
+
+  PyObject * exception;
+};
 
 /**
  * Arrow base iterator implementation in C++.
@@ -21,26 +56,18 @@ namespace sf
 class CArrowIterator
 {
 public:
-  CArrowIterator() = default;
+  CArrowIterator(std::vector<std::shared_ptr<arrow::RecordBatch>> * batches);
 
   virtual ~CArrowIterator() = default;
 
   /**
-   * Add Arrow RecordBach to current chunk
-   * @param rb recordbatch to be added
-   */
-  virtual void addRecordBatch(PyObject* rb);
-
-  /**
    * @return a python object which might be current row or an Arrow Table
    */
-  virtual PyObject* next() = 0;
-
-  virtual void reset() = 0;
+  virtual std::shared_ptr<ReturnVal> next() = 0;
 
 protected:
    /** list of all record batch in current chunk */
-  std::vector<std::shared_ptr<arrow::RecordBatch>> m_cRecordBatches;
+  std::vector<std::shared_ptr<arrow::RecordBatch>> *m_cRecordBatches;
 
   static Logger logger;
 };
